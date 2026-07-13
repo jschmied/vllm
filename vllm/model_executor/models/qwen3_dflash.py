@@ -39,6 +39,11 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+)
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
@@ -87,14 +92,6 @@ def _resolve_layer_attention(
         num_sliding = sum(lt == SLIDING_ATTENTION for lt in layer_types)
         any_sliding = num_sliding > 0
         all_sliding = num_sliding == len(layer_types)
-        if any_sliding and not all_sliding:
-            # Mixed sliding/full attention needs per-layer causal metadata and
-            # multiple KV-cache groups, which DFlash does not yet support.
-            raise NotImplementedError(
-                "DFlash does not yet support mixed sliding/full attention via "
-                "layer_types; see "
-                "https://github.com/vllm-project/vllm/issues/40898."
-            )
 
     default_causal = False
     if layer_types is None or (use_swa and not any_sliding):
@@ -120,6 +117,29 @@ def _resolve_layer_attention(
 
     causal = config_causal if config_causal is not None else default_causal
     return sliding_window, causal
+
+
+class DFlashAttention(Attention):
+    """Attention with DFlash-specific KV allocation semantics.
+
+    The compute path keeps the layer's configured sliding window. The KV cache
+    spec is widened to full attention because DFlash writes every context KV
+    before drafting and cannot evict old context blocks from draft layers.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if isinstance(spec, SlidingWindowSpec):
+            return FullAttentionSpec(
+                block_size=spec.block_size,
+                num_kv_heads=spec.num_kv_heads,
+                head_size=spec.head_size,
+                head_size_v=getattr(spec, "head_size_v", spec.head_size),
+                dtype=spec.dtype,
+                kv_quant_mode=spec.kv_quant_mode,
+                page_size_padded=spec.page_size_padded,
+            )
+        return spec
 
 
 class DFlashQwen3Attention(nn.Module):
@@ -195,7 +215,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -374,6 +394,12 @@ class DFlashQwen3Model(nn.Module):
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
+        # PR#40898: the proposer specializes SWA layers with causal metadata.
+        self.sliding_attention_layer_names = {
+            layer.self_attn.attn.layer_name
+            for layer in self.layers
+            if layer.self_attn.sliding_window is not None
+        }
         if self.use_aux_hidden_state:
             num_features_to_use = self.config.num_hidden_layers
             if "target_layer_ids" in drafter_config:
@@ -736,6 +762,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    @property
+    def sliding_attention_layer_names(self) -> set[str]:
+        return self.model.sliding_attention_layer_names
 
     def combine_hidden_states(
         self,
