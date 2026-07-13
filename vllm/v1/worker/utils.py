@@ -219,6 +219,23 @@ class KVBlockZeroer:
         )
 
 
+def attn_group_window_key(layer: object) -> int | None:
+    """Per-layer sliding window, for use in attention-group dedup keys.
+
+    An attention group shares one metadata builder, and backends size their plan
+    from group-wide hyperparameters: FlashInfer plans a single prefill wrapper per
+    group and asserts ``prefill_wrapper._window_left == self.window_left``, so a
+    group must be window-uniform.
+
+    Normally the KVCacheSpec already separates windows (a sliding layer gets a
+    ``SlidingWindowSpec``), so this is a no-op. It matters when a layer keeps its
+    compute window but reports a full-attention KV spec -- as DFlash draft layers do,
+    since DFlash writes all context K/V up front and must not have context blocks
+    evicted from the draft KV cache.
+    """
+    return getattr(layer, "sliding_window", None)
+
+
 @dataclass
 class AttentionGroup:
     backend: type[AttentionBackend]

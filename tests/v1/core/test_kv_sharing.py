@@ -112,6 +112,7 @@ def test_dflash_draft_kv_groups_keep_hybrid_tensor_sharing():
     spec = new_kv_cache_spec()
     num_blocks = 8
     vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
         speculative_config=SimpleNamespace(method="dflash"),
         cache_config=SimpleNamespace(num_gpu_blocks_override=None),
     )

@@ -1566,3 +1566,198 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+# ---------------------------------------------------------------------------
+# Raw-KV layout bridge.
+#
+# A DFlash draft layer shares the target's raw KV tensor. Backends disagree on how
+# that buffer is laid out: FlashAttention exposes it kv-major (2, num_blocks, ...),
+# FlashInfer block-major (num_blocks, 2, ...). If both simply .view() the shared
+# buffer in their own order, each reads the other's writes transposed. That does not
+# crash and does not corrupt output (drafts are verified against the target) -- it
+# silently destroys acceptance, so it must be covered by tests rather than by luck.
+#
+# Serving both layouts at once needs two backends on one box, which we cannot do in a
+# unit test. What we CAN pin down is the contract the bridge exists to satisfy:
+#   1. aliasing   -- a write through one backend's view is visible, at the same logical
+#                    index, through the other backend's view;
+#   2. detection  -- layers sharing a raw tensor with different layouts are seen as
+#                    such, and identical layouts are not mistaken for a conflict;
+#   3. selection  -- the layout they agree to speak is deterministic and block-major.
+# ---------------------------------------------------------------------------
+
+KV_MAJOR = ("kv", "block", "token", "head", "dim")
+BLOCK_MAJOR = ("block", "kv", "token", "head", "dim")
+
+
+def _fake_backend(name, stride_order, kv_major):
+    """Backend stub exposing the two real standard KV layouts."""
+
+    class _Backend:
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str=None
+        ):
+            if kv_major:
+                return (2, num_blocks, block_size, num_kv_heads, head_size)
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+
+        @staticmethod
+        def get_kv_cache_stride_order():
+            return stride_order
+
+        @classmethod
+        def full_cls_name(cls):
+            return ("test", name)
+
+    return _Backend
+
+
+def test_bridge_aliases_the_same_element_across_layouts():
+    """The invariant: both backends' views must address the same element.
+
+    Write through the block-major view; read through the kv-major view built by the
+    bridge; the value must appear at the same logical (kv, block, token, head, dim).
+    A plain .view() in the wrong order silently reads a different element -- that is
+    the acceptance-killer this bridge prevents.
+    """
+    num_blocks, block_size, num_kv_heads, head_size = 3, 4, 2, 8
+    kv_major_shape = (2, num_blocks, block_size, num_kv_heads, head_size)
+    raw = torch.zeros(2 * num_blocks * block_size * num_kv_heads * head_size)
+
+    # the raw buffer is physically laid out block-major (the allocator's layout)
+    block_major_view = raw.view(num_blocks, 2, block_size, num_kv_heads, head_size)
+    # the bridge hands a kv-major backend its own public shape over that same memory
+    kv_major_view = GPUModelRunner._view_kv_cache_with_physical_order(
+        raw, kv_major_shape, KV_MAJOR, BLOCK_MAJOR
+    )
+
+    assert kv_major_view.shape == kv_major_shape
+    # every logical coordinate must alias
+    for kv in range(2):
+        for blk in range(num_blocks):
+            for tok in range(block_size):
+                block_major_view[blk, kv, tok, 1, 3] = 1000 + kv * 100 + blk * 10 + tok
+    for kv in range(2):
+        for blk in range(num_blocks):
+            for tok in range(block_size):
+                assert (
+                    kv_major_view[kv, blk, tok, 1, 3]
+                    == 1000 + kv * 100 + blk * 10 + tok
+                )
+
+    # and the naive view -- what happens WITHOUT the bridge -- does not alias, i.e.
+    # this test would be vacuous if the two layouts happened to coincide
+    naive = raw.view(kv_major_shape)
+    assert not torch.equal(naive, kv_major_view)
+
+
+def test_pick_shared_physical_order_prefers_block_major_and_is_deterministic():
+    assert (
+        GPUModelRunner._pick_shared_physical_order({KV_MAJOR, BLOCK_MAJOR})
+        == BLOCK_MAJOR
+    )
+    # order of iteration must not matter
+    assert (
+        GPUModelRunner._pick_shared_physical_order({BLOCK_MAJOR, KV_MAJOR})
+        == BLOCK_MAJOR
+    )
+    # single layout: that one
+    assert GPUModelRunner._pick_shared_physical_order({KV_MAJOR}) == KV_MAJOR
+    assert GPUModelRunner._pick_shared_physical_order(set()) is None
+
+
+def test_raw_tensor_physical_orders_detects_layout_conflict():
+    """Two backends sharing one raw tensor must be reported as two layouts (and one
+    backend, or two agreeing ones, as a single layout -- no false conflicts)."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    num_blocks, block_size, num_kv_heads, head_size = 3, 4, 2, 8
+    # A stand-in AttentionSpec: _get_raw_tensor_physical_orders only reads these fields,
+    # and patching AttentionSpec to SimpleNamespace below keeps its isinstance() check
+    # satisfied without dragging in the real spec's constructor requirements.
+    spec = SimpleNamespace(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        page_size_bytes=2 * block_size * num_kv_heads * head_size,
+    )
+    raw = torch.zeros(2 * num_blocks * block_size * num_kv_heads * head_size)
+
+    fa = _fake_backend("fa", (0, 1, 2, 3, 4), kv_major=True)  # (2, blocks, ...)
+    fi = _fake_backend("fi", (0, 1, 2, 3, 4), kv_major=False)  # (blocks, 2, ...)
+
+    def orders_for(backends):
+        groups = [
+            SimpleNamespace(
+                kv_cache_spec=spec,
+                backend=b,
+                kv_cache_group_id=0,
+                layer_names=[f"layer.{i}"],
+            )
+            for i, b in enumerate(backends)
+        ]
+        runner = SimpleNamespace(
+            _kv_cache_spec_attn_group_iterator=lambda: iter(groups),
+            runner_only_attn_layers=set(),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            _get_standard_kv_cache_orders=GPUModelRunner._get_standard_kv_cache_orders,
+        )
+        raw_tensors = {g.layer_names[0]: raw for g in groups}
+        return GPUModelRunner._get_raw_tensor_physical_orders(
+            runner, raw_tensors, [block_size]
+        )
+
+    with patch("vllm.v1.worker.gpu_model_runner.AttentionSpec", SimpleNamespace):
+        conflicting = orders_for([fa, fi])
+        agreeing = orders_for([fi, fi])
+
+    assert len(next(iter(conflicting.values()))) == 2, "layout conflict not detected"
+    assert len(next(iter(agreeing.values()))) == 1, "false layout conflict reported"
+
+
+def test_resolve_shared_layout_plain_reshape_when_layouts_agree():
+    """No conflict -> no bridging: layers that agree keep the plain (cheaper) view."""
+    assert (
+        GPUModelRunner._resolve_shared_layout(
+            "l0", KV_MAJOR, KV_MAJOR, KV_MAJOR, None, False
+        )
+        is None
+    )
+    # nothing shared / unknown layout -> also a plain reshape
+    assert (
+        GPUModelRunner._resolve_shared_layout("l0", None, None, None, None, False)
+        is None
+    )
+
+
+def test_resolve_shared_layout_bridges_conflicting_layouts():
+    """Conflict on an ordinary page -> re-stride onto the shared layout."""
+    assert (
+        GPUModelRunner._resolve_shared_layout(
+            "l0", KV_MAJOR, KV_MAJOR, BLOCK_MAJOR, None, False
+        )
+        == BLOCK_MAJOR
+    )
+
+
+@pytest.mark.parametrize(
+    "page_size_padded,is_packed", [(512, False), (None, True), (512, True)]
+)
+def test_resolve_shared_layout_refuses_unbridgeable_conflict(
+    page_size_padded, is_packed
+):
+    """The hole we cannot bridge must be LOUD.
+
+    as_strided cannot express a padded/packed page on top of a foreign dim order. The
+    tempting fallback -- just do the plain reshape -- does not crash and does not
+    corrupt output (drafts are verified against the target); it silently reads the
+    other backend's writes transposed and quietly destroys draft acceptance. A config
+    that cannot be served correctly must fail at startup instead.
+    """
+    with pytest.raises(NotImplementedError, match="orders it differently"):
+        GPUModelRunner._resolve_shared_layout(
+            "l0", KV_MAJOR, KV_MAJOR, BLOCK_MAJOR, page_size_padded, is_packed
+        )

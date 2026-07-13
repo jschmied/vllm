@@ -218,7 +218,10 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    attn_group_window_key,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -6835,6 +6838,8 @@ class GPUModelRunner(
             attn_backend: type[AttentionBackend]
             kv_cache_spec: KVCacheSpec
             num_heads_q: int
+            # Window-uniform groups: see attn_group_window_key().
+            sliding_window: int | None = None
 
         def get_attn_backends_for_group(
             kv_cache_group_spec: KVCacheGroupSpec,
@@ -6870,9 +6875,10 @@ class GPUModelRunner(
                 # fallback can never spuriously merge them with attention
                 # layers.
                 num_heads_q = getattr(layers[layer_name], "num_heads", 0)
-                key = (full_cls_name, layer_kv_cache_spec, num_heads_q)
+                layer_window = attn_group_window_key(layers[layer_name])
+                key = (full_cls_name, layer_kv_cache_spec, num_heads_q, layer_window)
                 attn_backends[key] = AttentionGroupKey(
-                    attn_backend, layer_kv_cache_spec, num_heads_q
+                    attn_backend, layer_kv_cache_spec, num_heads_q, layer_window
                 )
                 attn_backend_layers[key].append(layer_name)
             return (
@@ -7174,29 +7180,6 @@ class GPUModelRunner(
         return stride_order, public_order, tuple(public_order[i] for i in stride_order)
 
     @staticmethod
-    def _view_kv_cache_with_physical_order(
-        raw_tensor: torch.Tensor,
-        kv_cache_shape: tuple[int, ...],
-        public_order: tuple[str, ...],
-        physical_order: tuple[str, ...],
-    ) -> torch.Tensor:
-        # Backends can expose the same standard KV cache with different public
-        # shapes or physical orders. When they share one raw tensor, keep each
-        # backend's public shape but map it to the shared physical layout.
-        dim_sizes = dict(zip(public_order, kv_cache_shape))
-        physical_strides: dict[str, int] = {}
-        stride = 1
-        for dim in reversed(physical_order):
-            physical_strides[dim] = stride
-            stride *= dim_sizes[dim]
-        public_strides = tuple(physical_strides[dim] for dim in public_order)
-        return torch.as_strided(
-            raw_tensor,
-            size=kv_cache_shape,
-            stride=public_strides,
-        )
-
-    @staticmethod
     def _get_attention_kv_cache_shape(
         attn_backend: type[AttentionBackend],
         kv_cache_spec: AttentionSpec,
@@ -7217,11 +7200,40 @@ class GPUModelRunner(
             cache_dtype_str=cache_dtype_str,
         )
 
+    @staticmethod
+    def _view_kv_cache_with_physical_order(
+        raw_tensor: torch.Tensor,
+        kv_cache_shape: tuple[int, ...],
+        public_order: tuple[str, ...],
+        physical_order: tuple[str, ...],
+    ) -> torch.Tensor:
+        # Backends can expose the same standard KV cache with different public
+        # shapes or physical orders. When they share one raw tensor, keep each
+        # backend's public shape but map it to the shared physical layout.
+        dim_sizes = dict(zip(public_order, kv_cache_shape))
+        physical_strides: dict[str, int] = {}
+        stride = 1
+        for dim in reversed(physical_order):
+            physical_strides[dim] = stride
+            stride *= dim_sizes[dim]
+        public_strides = tuple(physical_strides[dim] for dim in public_order)
+        return torch.as_strided(
+            raw_tensor,
+            kv_cache_shape,
+            public_strides,
+        )
+
     def _get_raw_tensor_physical_orders(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
     ) -> dict[int, set[tuple[str, ...]]]:
+        """Physical dim orders each raw KV tensor is viewed with, keyed by tensor id.
+
+        A DFlash draft layer shares the target's raw KV tensor. If the two backends
+        order that buffer differently, each would read the other's writes transposed,
+        so the views must be reconciled (see _view_kv_cache_with_physical_order).
+        """
         raw_tensor_physical_orders: dict[int, set[tuple[str, ...]]] = defaultdict(set)
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
@@ -7239,21 +7251,72 @@ class GPUModelRunner(
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 num_blocks *= kv_cache_spec.block_size // kernel_block_size
-                kv_cache_shape = self._get_attention_kv_cache_shape(
-                    group.backend,
-                    kv_cache_spec,
+                kv_cache_shape = group.backend.get_kv_cache_shape(
                     num_blocks,
                     kernel_block_size,
-                    self.cache_config.cache_dtype,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype_str=self.cache_config.cache_dtype,
                 )
                 _, _, physical_order = self._get_standard_kv_cache_orders(
-                    group.backend,
-                    kv_cache_shape,
-                    num_blocks,
+                    group.backend, kv_cache_shape, num_blocks
                 )
                 if physical_order is not None:
                     raw_tensor_physical_orders[id(raw_tensor)].add(physical_order)
         return raw_tensor_physical_orders
+
+    @staticmethod
+    def _pick_shared_physical_order(
+        shared_orders: set[tuple[str, ...]],
+    ) -> tuple[str, ...] | None:
+        """Choose the layout that layers sharing one raw KV tensor agree to speak.
+
+        Deterministic, and block-major wins: that is the layout the allocator lays the
+        raw buffer out in, so preferring it keeps the majority of layers on a plain
+        view and only re-strides the odd one out.
+        """
+        block_major = (order for order in shared_orders if order[:2] == ("block", "kv"))
+        return next(iter(sorted(block_major)), None) or next(
+            iter(sorted(shared_orders)), None
+        )
+
+    @staticmethod
+    def _resolve_shared_layout(
+        layer_name: str,
+        public_order: tuple[str, ...] | None,
+        physical_order: tuple[str, ...] | None,
+        shared_physical_order: tuple[str, ...] | None,
+        page_size_padded: int | None,
+        is_packed: bool,
+    ) -> tuple[str, ...] | None:
+        """Physical order this layer must re-stride to, or None for a plain reshape.
+
+        Layers sharing one raw KV tensor (a DFlash draft layer shares the target's)
+        can disagree on how it is laid out: FlashAttention exposes it kv-major,
+        FlashInfer block-major. Whoever loses that vote must build its view against
+        the shared layout, or it reads the other's writes transposed -- which neither
+        crashes nor corrupts output (drafts are verified), it just silently destroys
+        acceptance.
+
+        Raises when the conflict cannot be bridged: ``as_strided`` cannot express a
+        padded or packed page on top of a foreign dim order, and quietly falling back
+        to the plain reshape there would reintroduce exactly that silent bug.
+        """
+        conflict = (
+            public_order is not None
+            and shared_physical_order is not None
+            and physical_order != shared_physical_order
+        )
+        if not conflict:
+            return None
+        if page_size_padded is not None or is_packed:
+            raise NotImplementedError(
+                f"Layer {layer_name} shares a raw KV cache tensor with a backend that "
+                f"orders it differently ({physical_order} vs {shared_physical_order}), "
+                "and its KV pages are padded or packed, which the layout bridge cannot "
+                "re-stride. Use the same attention backend for target and draft."
+            )
+        return shared_physical_order
 
     def _reshape_kv_cache_tensors(
         self,
@@ -7273,6 +7336,9 @@ class GPUModelRunner(
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
+        raw_tensor_physical_orders = self._get_raw_tensor_physical_orders(
+            kv_cache_raw_tensors, kernel_block_sizes
+        )
 
         # Map layer names to (offset, block_stride) within the packed
         # backing tensor so we can create strided views per layer.
@@ -7337,6 +7403,35 @@ class GPUModelRunner(
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
                     raw_tensor = kv_cache_raw_tensors[layer_name]
+
+                    # Layers sharing one raw KV tensor (DFlash draft layers share the
+                    # target's) may order it differently per backend. Keep this
+                    # backend's public shape but map it onto the shared physical
+                    # layout, else each side reads the other's writes transposed.
+                    _, public_order, physical_order = (
+                        self._get_standard_kv_cache_orders(
+                            attn_backend, kv_cache_shape, kernel_num_blocks
+                        )
+                    )
+                    shared_layout = self._resolve_shared_layout(
+                        layer_name,
+                        public_order,
+                        physical_order,
+                        self._pick_shared_physical_order(
+                            raw_tensor_physical_orders[id(raw_tensor)]
+                        ),
+                        kv_cache_spec.page_size_padded,
+                        packing is not None,
+                    )
+                    if shared_layout is not None:
+                        kv_caches[layer_name] = self._view_kv_cache_with_physical_order(
+                            raw_tensor.view(kv_cache_spec.dtype),
+                            kv_cache_shape,
+                            public_order,
+                            shared_layout,
+                        )
+                        continue
+
                     kv_caches[layer_name] = _reshape_attention_kv_cache(
                         raw_tensor,
                         kv_cache_spec,

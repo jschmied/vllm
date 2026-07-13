@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, attn_group_window_key
 
 logger = init_logger(__name__)
 
@@ -239,7 +239,11 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             attn_backend = attn_layer.get_attn_backend()
             spec = layer_to_spec[layer_name]
             gid = layer_to_gid[layer_name]
-            group_key = (attn_backend.full_cls_name(), spec)
+            # Window-uniform groups (see attn_group_window_key): z-lab ships a mixed
+            # sliding/full DFlash drafter for Gemma-4, whose draft layers report a
+            # full-attention KV spec while keeping their compute window.
+            layer_window = attn_group_window_key(attn_layer)
+            group_key = (attn_backend.full_cls_name(), spec, layer_window)
 
             if group_key not in attention_groups:
                 kernel_block_size = (

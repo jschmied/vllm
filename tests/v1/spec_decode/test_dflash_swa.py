@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import SpeculativeConfig
@@ -86,7 +87,12 @@ def test_dflash_speculators_preserves_swa_config():
     assert hf_config["sliding_window"] == 2048
     assert hf_config["max_window_layers"] == len(layer_types)
     assert hf_config["eagle_aux_hidden_state_layer_ids"] == [1, 2, 3]
-    assert hf_config["dflash_config"]["target_layer_ids"] == [0, 1, 2]
+    # ``dflash_config.target_layer_ids`` is stored offset by one and re-based in the
+    # model runner (``[i + 1 for i in target_layer_ids]``), so it round-trips back to
+    # the ids given in the speculators config. Note this is a different id space from
+    # ``eagle_aux_hidden_state_layer_ids`` above. Assert the round-trip rather than the
+    # raw storage convention.
+    assert [i + 1 for i in hf_config["dflash_config"]["target_layer_ids"]] == [0, 1, 2]
 
 
 def _compute_dflash_hash(hf_config: SimpleNamespace) -> str:
@@ -201,3 +207,186 @@ def test_dflash_metadata_uses_per_kv_group_slot_mapping():
     assert per_layer["layer.sw"].block_table_tensor is sw_block_table
     torch.testing.assert_close(per_layer["layer.sw"].slot_mapping, sw_slots)
     assert per_layer["layer.sw"].causal is True
+
+
+def test_attn_group_window_key_reports_layer_window():
+    """The group key must see the layer's compute window, not its KV spec.
+
+    DFlashAttention widens a sliding layer's KV spec to full attention (so DFlash's
+    prewritten context K/V is never evicted), which erases the only thing that used to
+    separate windowed layers from full ones in the attention-group key.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.utils import attn_group_window_key
+
+    assert attn_group_window_key(SimpleNamespace(sliding_window=2048)) == 2048
+    assert attn_group_window_key(SimpleNamespace(sliding_window=None)) is None
+    # non-attention layers (Mamba/GDN/short-conv) have no window at all
+    assert attn_group_window_key(SimpleNamespace()) is None
+
+
+def test_attn_group_key_separates_windows_under_one_kv_spec():
+    """Layers that share a backend+spec but differ in window must not share a group.
+
+    An attention group shares one metadata builder; FlashInfer plans a single prefill
+    wrapper per group and asserts ``prefill_wrapper._window_left == self.window_left``.
+    Grouping a 2048-window draft layer with a full-attention one therefore fails at
+    runtime ("Window left is not the same for all layers"), and -- if the key collides
+    outright -- silently drops one group's layers, which then never get a KV cache view.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.utils import attn_group_window_key
+
+    backend, spec, num_heads_q = "FlashInferBackend", object(), 8
+    sliding = SimpleNamespace(sliding_window=2048)
+    full = SimpleNamespace(sliding_window=None)
+
+    def key(layer):
+        return (backend, spec, num_heads_q, attn_group_window_key(layer))
+
+    assert key(sliding) != key(full)
+    # ... and layers that agree on the window still share a group (no gratuitous splits)
+    assert key(sliding) == key(SimpleNamespace(sliding_window=2048))
+    assert key(full) == key(SimpleNamespace(sliding_window=None))
+
+
+# ---------------------------------------------------------------------------
+# The guards that keep a mis-wired drafter from failing SILENTLY.
+#
+# A drafter with wrong KV plumbing or wrong causality does not crash and does not
+# corrupt output -- drafts are verified against the target -- it just stops being
+# accepted, and the only symptom is that serving is mysteriously slower than no
+# speculation at all. These guards turn that into a startup/step error, so they are
+# worth testing in their own right.
+# ---------------------------------------------------------------------------
+
+
+def _bare_dflash_proposer(**attrs):
+    """A DFlashProposer with only the fields a given method touches.
+
+    __init__ wants a full VllmConfig and a device; object.__new__ skips it so the real
+    methods can be exercised against hand-set state.
+    """
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    proposer = object.__new__(DFlashProposer)
+    for name, value in attrs.items():
+        setattr(proposer, name, value)
+    return proposer
+
+
+def test_multi_group_drafting_is_opt_in():
+    """Base proposers must NOT silently accept a drafter spanning several KV groups.
+
+    This is the assertion that rejects a naive multi-group port: without per-group slot
+    mappings the second group's KV lands at the wrong slots and acceptance drops to
+    ~zero while output stays correct. DFlash opts in because it does that plumbing.
+    """
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    base = object.__new__(SpecDecodeBaseProposer)
+    dflash = object.__new__(DFlashProposer)
+
+    assert base.allow_multiple_draft_kv_cache_groups() is False
+    assert dflash.allow_multiple_draft_kv_cache_groups() is True
+
+
+def test_missing_per_group_kv_metadata_raises():
+    """A draft KV group with no block table registered must raise, not guess.
+
+    The model runner pushes one block table per KV cache group; if that wiring is
+    missing, reading the primary group's table for every group would silently address
+    the wrong blocks.
+    """
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    cad = SimpleNamespace(block_table_tensor=torch.zeros(2, 4, dtype=torch.int32))
+    proposer = _bare_dflash_proposer(_draft_block_tables={}, kv_cache_gid=0)
+
+    # the primary group may fall back to the common metadata's table ...
+    assert (
+        DFlashProposer._get_dflash_block_table(proposer, 0, cad)
+        is cad.block_table_tensor
+    )
+    # ... but a second group with nothing registered is a wiring bug, so refuse.
+    with pytest.raises(RuntimeError, match="Missing DFlash KV metadata"):
+        DFlashProposer._get_dflash_block_table(proposer, 1, cad)
+
+
+def _dflash_proposer_with_groups(sliding_layers, metadata_by_layer):
+    """DFlashProposer with one attention group per layer, returning canned metadata."""
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    groups = []
+    for layer_name, attn_metadata in metadata_by_layer.items():
+
+        def _build(common_attn_metadata, draft_index, _m=attn_metadata):
+            return _m
+
+        builder = SimpleNamespace(build_for_drafting=_build)
+        groups.append(
+            SimpleNamespace(
+                kv_cache_group_id=0,
+                layer_names=[layer_name],
+                get_metadata_builder=lambda _b=builder: _b,
+            )
+        )
+    return _bare_dflash_proposer(
+        draft_attn_groups=groups,
+        dflash_causal=False,
+        model=SimpleNamespace(sliding_attention_layer_names=set(sliding_layers)),
+        _draft_block_tables={0: torch.zeros(2, 4, dtype=torch.int32)},
+        _slot_mapping_buffers_by_gid={
+            0: (torch.zeros(8, dtype=torch.int64), torch.zeros(8, dtype=torch.int64))
+        },
+        _ensure_slot_mapping_buffers=lambda: None,
+        kv_cache_gid=0,
+    ), DFlashProposer
+
+
+def _fake_cad():
+    cad = SimpleNamespace(
+        num_actual_tokens=4, block_table_tensor=torch.zeros(2, 4, dtype=torch.int32)
+    )
+    cad.replace = lambda **kw: cad  # metadata builders are stubbed; identity is enough
+    return cad
+
+
+def test_causality_per_layer_is_enforced():
+    """Sliding draft layers must be causal, full-attention ones must not.
+
+    z-lab's mixed drafters train the SWA layers causal and the full layer non-causal.
+    Drafting with the causality flipped produces plausible-looking but useless drafts:
+    output stays correct (the target verifies), acceptance just collapses. Assert
+    instead of hoping the backend planned the right mask.
+    """
+    good = {
+        "swa": SimpleNamespace(causal=True),
+        "full": SimpleNamespace(causal=False),
+    }
+    proposer, cls = _dflash_proposer_with_groups({"swa"}, good)
+    per_group, per_layer = cls.build_per_group_and_layer_attn_metadata(
+        proposer, _fake_cad()
+    )
+    assert set(per_layer) == {"swa", "full"}
+
+    # a full-attention layer that came back causal is a mis-planned mask -> refuse
+    bad_full = {
+        "swa": SimpleNamespace(causal=True),
+        "full": SimpleNamespace(causal=True),
+    }
+    proposer, cls = _dflash_proposer_with_groups({"swa"}, bad_full)
+    with pytest.raises(AssertionError, match="non-causal support"):
+        cls.build_per_group_and_layer_attn_metadata(proposer, _fake_cad())
+
+    # ... and a sliding layer that came back non-causal likewise
+    bad_swa = {
+        "swa": SimpleNamespace(causal=False),
+        "full": SimpleNamespace(causal=False),
+    }
+    proposer, cls = _dflash_proposer_with_groups({"swa"}, bad_swa)
+    with pytest.raises(AssertionError, match="causal support"):
+        cls.build_per_group_and_layer_attn_metadata(proposer, _fake_cad())

@@ -18,7 +18,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, attn_group_window_key
 
 
 class Step3p5MTPProposer(EagleProposer):
@@ -217,7 +217,9 @@ class Step3p5MTPProposer(EagleProposer):
             attn_backend = attn_layer.get_attn_backend()
             spec = layer_to_spec[layer_name]
             gid = layer_to_gid[layer_name]
-            group_key = (attn_backend.full_cls_name(), gid)
+            # Window-uniform groups; see attn_group_window_key().
+            layer_window = attn_group_window_key(all_attn_layers[layer_name])
+            group_key = (attn_backend.full_cls_name(), gid, layer_window)
 
             if group_key not in attention_groups:
                 kernel_block_size = (

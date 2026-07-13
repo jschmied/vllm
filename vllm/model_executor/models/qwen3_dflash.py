@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -89,9 +89,7 @@ def _resolve_layer_attention(
     SLIDING_ATTENTION = "sliding_attention"
     any_sliding = False
     if layer_types is not None:
-        num_sliding = sum(lt == SLIDING_ATTENTION for lt in layer_types)
-        any_sliding = num_sliding > 0
-        all_sliding = num_sliding == len(layer_types)
+        any_sliding = any(lt == SLIDING_ATTENTION for lt in layer_types)
 
     default_causal = False
     if layer_types is None or (use_swa and not any_sliding):
@@ -548,7 +546,10 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: torch.Tensor
+        | list[torch.Tensor | None]
+        | Mapping[str, torch.Tensor]
+        | None = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -601,13 +602,20 @@ class DFlashQwen3Model(nn.Module):
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
+        # PR#40898: with multiple draft KV cache groups the proposer hands back a
+        # per-layer-NAME mapping (one slot-mapping buffer per group), not a positional
+        # list. Resolve by attn.layer_name in that case.
+        by_name = isinstance(context_slot_mapping, Mapping)
         for i in range(L):
-            slot_mapping = (
-                context_slot_mapping[i] if per_layer else context_slot_mapping
-            )
+            attn = self._attn_layers[i]
+            if by_name:
+                slot_mapping = context_slot_mapping[attn.layer_name]
+            elif per_layer:
+                slot_mapping = context_slot_mapping[i]
+            else:
+                slot_mapping = context_slot_mapping
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
-            attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
@@ -756,7 +764,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+        context_slot_mapping: torch.Tensor
+        | list[torch.Tensor | None]
+        | Mapping[str, torch.Tensor]
+        | None = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
