@@ -171,6 +171,24 @@ class SpeculativeConfig:
 
     # dynamic speculative decoding control
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None
+    num_speculative_tokens_by_context_len: list[tuple[int, int]] | None = None
+    """Draft length as a function of CONTEXT LENGTH, as (min_context_tokens, k) pairs.
+
+    The optimal draft length is not a constant: a long, coherent context is highly
+    predictable, so the drafter stays confident deeper into the block, while a short
+    prompt starves it. Measured on Qwen3.6-27B + z-lab DFlash (accepted tokens/step):
+    at 1k context the optimum is k=8 and k=12 is already past the peak; at 32k it is
+    still climbing at k=12. Verification is near-free per extra token on a
+    memory-bound target, so the extra accepted tokens are pure profit.
+
+    The largest entry whose min_context_tokens <= the batch's context wins, and the
+    result is clamped to ``num_speculative_tokens`` (which sizes the proposer's
+    buffers, so it is a hard ceiling). Combined with
+    ``num_speculative_tokens_per_batch_size`` by taking the smaller of the two: deep
+    drafts win at low concurrency and lose under load.
+
+    Example: ``[[0, 8], [16000, 12], [24000, 16]]``
+    """
     """Batch-size schedule used to dynamically choose speculative-token count.
 
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an

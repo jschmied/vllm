@@ -390,3 +390,29 @@ def test_causality_per_layer_is_enforced():
     proposer, cls = _dflash_proposer_with_groups({"swa"}, bad_swa)
     with pytest.raises(AssertionError, match="causal support"):
         cls.build_per_group_and_layer_attn_metadata(proposer, _fake_cad())
+
+
+def test_draft_len_for_context():
+    """Context-adaptive draft length: deeper drafts on long contexts, capped by load.
+
+    Optimal draft length is not a constant -- measured on Qwen3.6-27B + z-lab DFlash,
+    accepted tokens/step peaks at k=8 for a 1k context but is still climbing at k=12
+    for 32k, because a long coherent context is more predictable and verification is
+    near-free per extra token on a memory-bound target.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    sched = object.__new__(Scheduler)
+    sched.ctx_sd_lookup = [(24000, 16), (16000, 12), (0, 8)]  # descending
+
+    ceiling = 16
+    assert sched.draft_len_for_context(500, ceiling) == 8
+    assert sched.draft_len_for_context(16000, ceiling) == 12
+    assert sched.draft_len_for_context(31000, ceiling) == 16
+
+    # the batch-size policy still wins when it is stricter: deep drafts lose under load
+    assert sched.draft_len_for_context(31000, 4) == 4
+
+    # unconfigured -> untouched
+    sched.ctx_sd_lookup = None
+    assert sched.draft_len_for_context(31000, 6) == 6

@@ -236,12 +236,25 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # (min_context_tokens, k), descending -- see
+        # SpeculativeConfig.num_speculative_tokens_by_context_len
+        self.ctx_sd_lookup: list[tuple[int, int]] | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+            if speculative_config.num_speculative_tokens_by_context_len:
+                self.ctx_sd_lookup = sorted(
+                    (
+                        (int(min_ctx), min(int(k), self.num_spec_tokens))
+                        for min_ctx, k in (
+                            speculative_config.num_speculative_tokens_by_context_len
+                        )
+                    ),
+                    reverse=True,
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
@@ -1096,6 +1109,19 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.ctx_sd_lookup is not None and num_scheduled_tokens:
+            # Draft deeper on long contexts. Key on the LONGEST context in the batch:
+            # the draft length is per-step, not per-request, and drafting too few tokens
+            # for the long request costs more than drafting a couple too many for the
+            # short ones (verification is near-free per extra token).
+            batch_ctx = max(
+                self.requests[req_id].num_computed_tokens
+                for req_id in num_scheduled_tokens
+                if req_id in self.requests
+            )
+            num_spec_tokens_to_schedule = self.draft_len_for_context(
+                batch_ctx, num_spec_tokens_to_schedule
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1168,6 +1194,21 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def draft_len_for_context(self, batch_ctx: int, current: int) -> int:
+        """Draft length for this step given the batch's longest context.
+
+        Takes the SMALLER of the context-based choice and whatever the batch-size
+        policy already picked: long contexts justify deeper drafts, but high
+        concurrency does not -- under load the extra draft tokens compete for the same
+        target forward pass, so the two constraints must both hold.
+        """
+        if not self.ctx_sd_lookup:
+            return current
+        for min_ctx, k in self.ctx_sd_lookup:
+            if batch_ctx >= min_ctx:
+                return min(current, k)
+        return current
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
