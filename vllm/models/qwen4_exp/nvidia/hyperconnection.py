@@ -25,6 +25,7 @@ Typical usage inside a transformer decoder layer::
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -67,6 +68,7 @@ class GatedResidual(nn.Module):
         config: HyperConnectionConfig,
         use_combine: bool = True,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -99,7 +101,7 @@ class GatedResidual(nn.Module):
                 + ([self.pad_size] if self.pad_size else []),
                 bias=False,
                 params_dtype=config.params_dtype,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
                 return_bias=False,
                 disable_tp=True,
@@ -110,7 +112,7 @@ class GatedResidual(nn.Module):
                 self.lora_rank,
                 bias=False,
                 params_dtype=config.params_dtype,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
@@ -119,7 +121,7 @@ class GatedResidual(nn.Module):
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
