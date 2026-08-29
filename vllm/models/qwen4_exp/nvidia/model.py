@@ -640,6 +640,7 @@ class Qwen4ExpForCausalLM(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
+            quant_config=self.quant_config,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (

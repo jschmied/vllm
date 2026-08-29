@@ -405,6 +405,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                     config.vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
+                    quant_config=self.quant_config,
                 )
         else:
             self.lm_head = PPMissingLayer()
