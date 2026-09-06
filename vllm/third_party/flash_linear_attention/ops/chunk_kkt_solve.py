@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 #
-# Ported from flash-linear-attention (fla-core 0.5.2,
+# Ported from flash-linear-attention (fla-core 0.5.2; gate in the natural-log
+# domain with exp(), as in the vendored kernels, instead of fla-core's log2/exp2,
 # fla/ops/gated_delta_rule/chunk_fwd.py): one Triton kernel that computes the
 # scaled K K^T lower-triangular block and solves (I + A)^-1 in one pass,
 # replacing chunk_scaled_dot_kkt_fwd + solve_tril for the 64-token chunk.
@@ -17,7 +18,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .op import exp2
+from .op import exp
 
 # Same knob and default as solve_tril.py, so the fused path matches the two-kernel
 # path bit-for-bit in precision policy (fla-core defaults this to tf32 on sm_80+).
@@ -176,22 +177,22 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     # apply gate, beta scaling, and masking
     # m_d: strictly lower triangular mask for diagonal blocks
     # m_tc: boundary mask to prevent NaN from 0 * inf (IEEE 754) when
-    #   out-of-bounds g loads as 0 via boundary_check and exp2(0 - g_inbounds) overflows
+    #   out-of-bounds g loads as 0 via boundary_check and exp(0 - g_inbounds) overflows
     m_d = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
 
     if USE_G:
-        b_A00 *= tl.where(m_d & m_tc0[:, None] & m_tc0[None, :], exp2(b_g0[:, None] - b_g0[None, :]), 0.)
-        b_A11 *= tl.where(m_d & m_tc1[:, None] & m_tc1[None, :], exp2(b_g1[:, None] - b_g1[None, :]), 0.)
-        b_A22 *= tl.where(m_d & m_tc2[:, None] & m_tc2[None, :], exp2(b_g2[:, None] - b_g2[None, :]), 0.)
-        b_A33 *= tl.where(m_d & m_tc3[:, None] & m_tc3[None, :], exp2(b_g3[:, None] - b_g3[None, :]), 0.)
+        b_A00 *= tl.where(m_d & m_tc0[:, None] & m_tc0[None, :], exp(b_g0[:, None] - b_g0[None, :]), 0.)
+        b_A11 *= tl.where(m_d & m_tc1[:, None] & m_tc1[None, :], exp(b_g1[:, None] - b_g1[None, :]), 0.)
+        b_A22 *= tl.where(m_d & m_tc2[:, None] & m_tc2[None, :], exp(b_g2[:, None] - b_g2[None, :]), 0.)
+        b_A33 *= tl.where(m_d & m_tc3[:, None] & m_tc3[None, :], exp(b_g3[:, None] - b_g3[None, :]), 0.)
 
-        b_A10 *= tl.where(m_tc1[:, None] & m_tc0[None, :], exp2(b_g1[:, None] - b_g0[None, :]), 0.)
-        b_A20 *= tl.where(m_tc2[:, None] & m_tc0[None, :], exp2(b_g2[:, None] - b_g0[None, :]), 0.)
-        b_A21 *= tl.where(m_tc2[:, None] & m_tc1[None, :], exp2(b_g2[:, None] - b_g1[None, :]), 0.)
-        b_A30 *= tl.where(m_tc3[:, None] & m_tc0[None, :], exp2(b_g3[:, None] - b_g0[None, :]), 0.)
-        b_A31 *= tl.where(m_tc3[:, None] & m_tc1[None, :], exp2(b_g3[:, None] - b_g1[None, :]), 0.)
-        b_A32 *= tl.where(m_tc3[:, None] & m_tc2[None, :], exp2(b_g3[:, None] - b_g2[None, :]), 0.)
+        b_A10 *= tl.where(m_tc1[:, None] & m_tc0[None, :], exp(b_g1[:, None] - b_g0[None, :]), 0.)
+        b_A20 *= tl.where(m_tc2[:, None] & m_tc0[None, :], exp(b_g2[:, None] - b_g0[None, :]), 0.)
+        b_A21 *= tl.where(m_tc2[:, None] & m_tc1[None, :], exp(b_g2[:, None] - b_g1[None, :]), 0.)
+        b_A30 *= tl.where(m_tc3[:, None] & m_tc0[None, :], exp(b_g3[:, None] - b_g0[None, :]), 0.)
+        b_A31 *= tl.where(m_tc3[:, None] & m_tc1[None, :], exp(b_g3[:, None] - b_g1[None, :]), 0.)
+        b_A32 *= tl.where(m_tc3[:, None] & m_tc2[None, :], exp(b_g3[:, None] - b_g2[None, :]), 0.)
     else:
         b_A00 = tl.where(m_d, b_A00, 0.)
         b_A11 = tl.where(m_d, b_A11, 0.)
