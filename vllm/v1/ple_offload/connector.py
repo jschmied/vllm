@@ -387,6 +387,17 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        # Clear any semaphore still raised by a dummy or capture forward before
+        # the CPU worker can raise this step's. capture_model() signals dummy
+        # outputs and then runs real steps through execute_model: the first
+        # real wait would otherwise pass on the dummy signal, its release would
+        # reset, and the worker's copy for that step would raise the flag for
+        # the *next* step -- every step then consumes the previous step's rows.
+        # The reset is per rank (each TP rank owns its buffer and semaphore),
+        # so it runs before the tp_rank check in _launch.
+        stream = torch.cuda.current_stream(self.device)
+        for layer in self._layers.values():
+            layer.release_offloaded_output(stream)
         self._launch(num_reqs, num_tokens)
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
