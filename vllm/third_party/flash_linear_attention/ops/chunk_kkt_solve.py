@@ -10,6 +10,8 @@
 # (1,565 -> 704 us at T=7503, H=48, K=128); the h / o / w_u kernels are
 # unchanged, so the whole chunk_gated_delta_rule forward gains 10-12 %.
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -17,11 +19,10 @@ from vllm.triton_utils import tl, triton
 from .index import prepare_chunk_indices
 from .op import exp2
 
-IS_TF32_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-if IS_TF32_SUPPORTED:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
-else:
-    SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
+# Same knob and default as solve_tril.py, so the fused path matches the two-kernel
+# path bit-for-bit in precision policy (fla-core defaults this to tf32 on sm_80+).
+FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
+SOLVE_TRIL_DOT_PRECISION = tl.constexpr(FLA_TRIL_PRECISION)
 
 
 @triton.heuristics({
