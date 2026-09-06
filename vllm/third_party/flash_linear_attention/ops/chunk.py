@@ -12,6 +12,7 @@ import torch
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
+from .chunk_kkt_solve import chunk_kkt_solve_fwd
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
@@ -38,17 +39,32 @@ def chunk_gated_delta_rule_fwd(
         g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
     # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        output_dtype=torch.float32,
-    )
-    A = solve_tril(
-        A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype
-    )
+    if FLA_CHUNK_SIZE == 64:
+        # One kernel for the scaled K K^T block and the (I + A)^-1 solve
+        # (ported from fla-core 0.5.2); identical result to the two-kernel path.
+        A = chunk_kkt_solve_fwd(
+            k=k,
+            beta=beta,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_size=FLA_CHUNK_SIZE,
+        )
+    else:
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=k.dtype,
+        )
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
