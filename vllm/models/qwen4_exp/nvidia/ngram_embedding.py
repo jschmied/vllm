@@ -638,6 +638,29 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             len({s.path for s in layout.shards}),
         )
 
+    def _lookup_on_current_stream(self, ngram_ids: torch.Tensor) -> None:
+        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+        self._lookup(
+            gathered_ids, output=self._prefetch_buffer[: gathered_ids.shape[0]]
+        )
+
+    @eager_break_during_capture
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Look up on the current stream, not the pinned backend's side stream.
+
+        With the side-stream lookup, greedy outputs on GB10 were not reproducible
+        within one server start (identical prompts matched in 2 of 8, logprobs
+        differed by up to 1.4); on the current stream they matched in 8 of 8 with
+        zero logprob difference. The CPU page prefetch already runs ahead of the
+        step, so the side stream buys no overlap worth keeping here.
+        """
+        self._lookup_on_current_stream(ngram_ids)
+
     def _lookup(
         self,
         input_ids: torch.Tensor,
