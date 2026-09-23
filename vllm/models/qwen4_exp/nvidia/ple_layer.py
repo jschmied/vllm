@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -110,9 +111,34 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
     ) -> None:
         del input_size, output_size, params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
-        weight = create_fp8_weight_parameter(
-            sum(output_partition_sizes), input_size_per_partition, weight_loader
-        )
+        # PAGEABLE-PROTO (finding 225): map the table instead of allocating it.
+        _pageable_file = os.environ.get("VLLM_PLE_PAGEABLE_FILE")
+        if os.environ.get("VLLM_PLE_PAGEABLE") == "checkpoint":
+            # v2: gather straight from the checkpoint's safetensors mappings.
+            from vllm.v1.ple_offload.pageable import map_checkpoint_table
+
+            layer._pageable_table = map_checkpoint_table(
+                sum(output_partition_sizes), input_size_per_partition
+            )
+            weight = nn.Parameter(
+                torch.empty(0, input_size_per_partition, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+        elif _pageable_file:
+            from vllm.v1.ple_offload.pageable import map_table
+
+            weight = nn.Parameter(
+                map_table(
+                    _pageable_file,
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                ),
+                requires_grad=False,
+            )
+        else:
+            weight = create_fp8_weight_parameter(
+                sum(output_partition_sizes), input_size_per_partition, weight_loader
+            )
         layer.register_parameter("weight", weight)
 
         weight_scale = create_fp8_scale_parameter(
@@ -140,6 +166,9 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         raise NotImplementedError("PLE FP8 weights only support embedding lookup")
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        table = getattr(layer, "_pageable_table", None)
+        if table is not None:
+            return table.gather(input_)
         return F.embedding(input_, layer.weight)
 
 
@@ -828,6 +857,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 and name.startswith(shard_prefix)
                 and name.endswith(".weight")
             ):
+                if os.environ.get("VLLM_PLE_PAGEABLE_FILE") or (
+                    os.environ.get("VLLM_PLE_PAGEABLE") == "checkpoint"
+                ):
+                    # PAGEABLE-PROTO: the rows already live in the mapped file.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))

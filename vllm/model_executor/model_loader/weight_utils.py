@@ -864,6 +864,17 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+_PLE_PAGEABLE_EMPTY = torch.empty(0)
+
+
+def _ple_pageable_skip(name: str) -> bool:
+    if os.environ.get("VLLM_PLE_PAGEABLE") != "checkpoint":
+        return False
+    from vllm.v1.ple_offload.pageable import is_pageable_shard_name
+
+    return is_pageable_shard_name(name)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -998,6 +1009,11 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
+                        continue
+                    if _ple_pageable_skip(name):
+                        # PAGEABLE-PROTO v2: the GPU reads these rows from the mapped file;
+                        # yield the name only so the loader marks the parameter loaded.
+                        yield name, _PLE_PAGEABLE_EMPTY
                         continue
                     param = f.get_tensor(name)
                     yield name, param

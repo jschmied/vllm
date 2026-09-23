@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 """
 
 import functools
+import os
 import gc
 import time
 from contextlib import AbstractContextManager
@@ -1835,6 +1836,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
+            )
+        # PAGEABLE-PROTO (finding 225): CPU prefetch of this step's PLE rows.
+        _pp = getattr(self, "_ple_pageable", None)
+        if (
+            _pp is None
+            and (
+                os.environ.get("VLLM_PLE_PAGEABLE_FILE")
+                or os.environ.get("VLLM_PLE_PAGEABLE") == "checkpoint"
+            )
+            and not dummy_run
+        ):
+            from vllm.v1.ple_offload.pageable import PagePrefetcher
+
+            _pp = self._ple_pageable = PagePrefetcher(
+                self.model,
+                self.device,
+                self.input_buffers.input_ids,
+                self.model_state.ple_query_start_loc,
+                self.model_state.ngram_context,
+                self.scheduler_config.max_num_batched_tokens,
+                self.scheduler_config.max_num_seqs,
+            )
+        if _pp is not None:
+            _pp.prepare_forward(
+                input_batch.num_reqs, input_batch.num_tokens_after_padding, dummy_run
             )
 
         # Run model.
