@@ -21,6 +21,12 @@ _NGRAM_LAYER_FIELDS = {
 }
 
 
+# Architectures whose Engram embedding implements checkpoint_mapped storage.
+_CHECKPOINT_MAPPED_ARCHITECTURES = frozenset(
+    {"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"}
+)
+
+
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
     """Whether the model carries n-gram embedding layers."""
     if model_config is None:
@@ -42,6 +48,14 @@ class EngramConfig:
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
 
+    checkpoint_mapped: bool = False
+    """Read embedding rows in place from the checkpoint's safetensors files
+    instead of storing the table (overrides cpu_offload). Requires a GPU that
+    reads pageable host memory through the host page tables (checked through
+    the CUDA device attributes at startup): the table then uses no device or
+    pinned memory, and its page-cache pages are reclaimable and shared between
+    processes. Validated on DGX Spark (GB10, unified memory) only; Qwen4Exp only."""
+
     dp_shared_memory: bool | None = None
     """Share CPU-offloaded embedding weights between co-located
     DP replicas. Each node stores one copy of every TP shard, reducing host
@@ -54,6 +68,11 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.dp_shared_memory and self.checkpoint_mapped:
+            raise ValueError(
+                "dp_shared_memory does not apply to checkpoint_mapped: mapped "
+                "checkpoint pages are already shared between processes"
+            )
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -75,12 +94,22 @@ class EngramConfig:
                 "EngramConfig requires a model with supported Engram "
                 "embeddings, non-empty n-gram layer ids, and CUDA."
             )
+        if (
+            self.checkpoint_mapped
+            and model_config.architecture not in _CHECKPOINT_MAPPED_ARCHITECTURES
+        ):
+            raise ValueError(
+                "Engram checkpoint_mapped is implemented for "
+                f"{sorted(_CHECKPOINT_MAPPED_ARCHITECTURES)} only, not "
+                f"{model_config.architecture}."
+            )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
                 self.cpu_offload
+                and not self.checkpoint_mapped
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
             )

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp n-gram embeddings with device and pinned-host storage."""
+"""Qwen4Exp n-gram embeddings with device, pinned-host and checkpoint-mapped storage."""
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
 
+import regex as re
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -45,6 +46,7 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_ngram_ids
+from .ple_pageable import MappedTable, discover_table_layout, require_pageable_access
 
 logger = init_logger(__name__)
 
@@ -218,6 +220,12 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Let storage that is bound after loading (checkpoint-mapped) attach."""
+        bind = getattr(layer, "bind_storage_after_loading", None)
+        if bind is not None:
+            bind()
+
     @abstractmethod
     def dequantize(
         self,
@@ -307,6 +315,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         sentinel = torch.finfo(torch.float32).min
         if torch.any(layer.weight_scale == sentinel):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
+        super().process_weights_after_loading(layer)
 
     def dequantize(
         self,
@@ -532,6 +541,186 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         return output
 
 
+class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+    """PLE table read in place from the checkpoint's safetensors files.
+
+    For GPUs that dereference pageable host memory through the host page tables
+    (e.g. unified-memory GB10). The table occupies no device or pinned memory:
+    its rows stay in the page cache as clean, reclaimable, cross-process shared
+    file pages. The lookup and ETP reduction reuse the pinned-host side-stream
+    flow; only the storage and the gather differ.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+    ) -> None:
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        require_pageable_access(device.index)
+        if not torch.cuda.get_device_properties(device).is_integrated:
+            logger.warning_once(
+                "Engram checkpoint_mapped has been validated only on integrated "
+                "unified-memory GPUs (DGX Spark / GB10). This device also reads "
+                "pageable host memory through the host page tables (e.g. Grace "
+                "Hopper / Grace Blackwell over NVLink-C2C), but performance and "
+                "correctness there are untested."
+            )
+        # Skip the pinned-host constructor: there is no host tensor to view.
+        Qwen4ExpPLEEmbedding.__init__(
+            self,
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        layer_match = re.search(r"layers\.(\d+)\.", prefix)
+        if layer_match is None:
+            raise ValueError(f"Cannot derive the decoder layer index from {prefix}")
+        self.layer_index = int(layer_match.group(1))
+        vllm_config = get_current_vllm_config()
+        self._model_config = vllm_config.model_config
+        self._load_config = vllm_config.load_config
+        self._load_format = str(vllm_config.load_config.load_format)
+        self.table: MappedTable | None = None
+        self._prefetch_stream = torch.cuda.Stream(device=device)
+        self._prefetch_buffer = torch.empty(
+            max_total_tokens * self.etp_data_parallel_size,
+            num_ngram_heads,
+            self.embedding_dim,
+            dtype=self.weight.dtype,
+            device=device,
+        )
+        self._output_dim = num_ngram_heads * self.embedding_dim
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """No storage: rows are read from the mapped checkpoint files."""
+        del num_embeddings
+        return torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
+
+    def bind_storage_after_loading(self) -> None:
+        """Map this layer's shards once the checkpoint is on local disk."""
+        if self.table is not None:
+            return
+        device = self._prefetch_buffer.device
+        if self._load_format == "dummy":
+            self.table = MappedTable.zeros(
+                self.org_vocab_size,
+                self.embedding_dim * self.weight.dtype.itemsize,
+                device,
+            )
+            return
+        layout = discover_table_layout(
+            resolve_checkpoint_files(self._model_config, self._load_config),
+            self.layer_index,
+            self.org_vocab_size,
+            self.embedding_dim,
+            self.weight.dtype,
+            int(getattr(self._model_config.hf_text_config, "split_ngram_parts", 512)),
+        )
+        self.table = MappedTable(layout, device)
+        logger.info(
+            "Mapped PLE table of layer %d in place: %d rows x %d B from %d files; "
+            "no device or pinned memory",
+            self.layer_index,
+            layout.num_rows,
+            layout.row_bytes,
+            len({s.path for s in layout.shards}),
+        )
+
+    def _lookup_on_current_stream(self, ngram_ids: torch.Tensor) -> None:
+        slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+        gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+        self._lookup(
+            gathered_ids, output=self._prefetch_buffer[: gathered_ids.shape[0]]
+        )
+
+    @eager_break_during_capture
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Look up on the current stream, not the pinned backend's side stream.
+
+        With the side-stream lookup, greedy outputs on GB10 were not reproducible
+        within one server start (identical prompts matched in 2 of 8, logprobs
+        differed by up to 1.4); on the current stream they matched in 8 of 8 with
+        zero logprob difference. The CPU page prefetch already runs ahead of the
+        step, so the side stream buys no overlap worth keeping here.
+        """
+        self._lookup_on_current_stream(ngram_ids)
+
+    def _lookup(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather this rank's rows from the mapped files; zeros elsewhere."""
+        if self.table is None:
+            raise RuntimeError("PLE checkpoint mapping was not bound after loading")
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if output is None:
+            output = torch.empty(
+                expected_shape, dtype=self.weight.dtype, device=input_ids.device
+            )
+        elif (
+            tuple(output.shape) != expected_shape
+            or output.dtype != self.weight.dtype
+            or output.device != input_ids.device
+        ):
+            raise ValueError(
+                "PLE prefetch output must match the input shape, weight dtype, "
+                "and input device"
+            )
+        self.table.gather_into(
+            input_ids.reshape(-1).long(),
+            output.view(torch.uint8).reshape(-1, self.table.row_bytes),
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+        )
+        return output
+
+
+def resolve_checkpoint_files(model_config, load_config) -> list[str]:
+    """The safetensors files the loader read, resolved exactly as it resolves them.
+
+    Reuses the default loader's preparation so ``--download-dir``, subfolders
+    and the ``model.safetensors.index.json`` filter all apply. The weights are
+    already local by the time the storage is bound, so nothing is downloaded.
+    """
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    _, files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
+        model_config.model_weights or model_config.model,
+        None,
+        model_config.revision,
+        fall_back_to_pt=False,
+        allow_patterns_overrides=None,
+    )
+    if not use_safetensors:
+        raise ValueError("Engram checkpoint_mapped requires a safetensors checkpoint")
+    return files
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     _MASK64 = (1 << 64) - 1
     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -700,11 +889,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        embedding_cls: type[Qwen4ExpPLEEmbedding]
+        if engram_config is not None and engram_config.checkpoint_mapped:
+            embedding_cls = Qwen4ExpPLEPageableHostEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -849,6 +1040,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    def cpu_ngram_ids_fn(self):
+        """A CPU-only ``compute_ngram_ids`` for host-side page prefetching."""
+        cpu = copy_module_for_cpu_ids(self)
+        return lambda ids, qsl, ctx: Qwen4ExpNGramEmbedding.compute_ngram_ids(
+            cpu, ids, qsl, ctx
+        )
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor,
@@ -904,6 +1102,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
                 embedding = self.ngram_embedding
+                if isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):
+                    # Rows are read in place from the checkpoint after loading;
+                    # the layout is validated when the mapping is bound.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
                 ) // self.split_ngram_parts
@@ -933,6 +1136,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return loaded
 
 
+def copy_module_for_cpu_ids(module: "Qwen4ExpNGramEmbedding"):
+    """An object with CPU copies of the hash buffers ``compute_ngram_ids`` reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        layer_multipliers=module.layer_multipliers.cpu(),
+        ngram_heads_vocab_sizes=module.ngram_heads_vocab_sizes.cpu(),
+        ngram_heads_offsets=module.ngram_heads_offsets.cpu(),
+        eos_token_id=module.eos_token_id,
+        ngram_size=module.ngram_size,
+        heads_per_ngram=module.heads_per_ngram,
+        _shift_precompute=Qwen4ExpNGramEmbedding._shift_precompute,
+        _shift_apply=Qwen4ExpNGramEmbedding._shift_apply,
+    )
+
+
 __all__ = [
     "Qwen4ExpNGramEmbedding",
+    "Qwen4ExpPLEPageableHostEmbedding",
 ]
