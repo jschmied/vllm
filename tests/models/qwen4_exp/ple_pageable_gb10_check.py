@@ -1,7 +1,7 @@
 import sys, time, json, numpy as np, torch
 
 from vllm.v1.ple_offload.pageable import CheckpointTable
-t = CheckpointTable("/opt/llm/models/qwen38-flash-next-mtpfp4", 320001536, 160)
+t = CheckpointTable("/opt/llm/models/qwen38-flash-next-mtpfp4", 320001536, 160, 128)
 ref = np.memmap("/opt/llm/models/ple-cache/qwen38-fn-plefp8.bin", dtype=np.uint8, mode="r").reshape(-1, 160)
 S = t.rows_per_shard; rng = np.random.default_rng(99)
 edges = np.concatenate([np.arange(t.num_shards) * S, np.arange(t.num_shards) * S + S - 1])

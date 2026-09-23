@@ -117,8 +117,9 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
             # v2: gather straight from the checkpoint's safetensors mappings.
             from vllm.v1.ple_offload.pageable import map_checkpoint_table
 
+            # org_vocab_size: the rows load_weights would require from the checkpoint.
             layer._pageable_table = map_checkpoint_table(
-                sum(output_partition_sizes), input_size_per_partition
+                layer.org_vocab_size, input_size_per_partition
             )
             weight = nn.Parameter(
                 torch.empty(0, input_size_per_partition, dtype=torch.float8_e4m3fn),
