@@ -52,9 +52,10 @@ class EngramConfig:
     """Read embedding rows in place from the checkpoint's safetensors files
     instead of storing the table (overrides cpu_offload). Requires a GPU that
     reads pageable host memory through the host page tables (checked through
-    the CUDA device attributes at startup): the table then uses no device or
-    pinned memory, and its page-cache pages are reclaimable and shared between
-    processes. Validated on DGX Spark (GB10, unified memory) only; Qwen4Exp only."""
+    the CUDA device attributes at startup): there is no table-sized device or
+    pinned allocation, and the table's clean, file-backed page-cache pages can
+    be dropped and re-read and are shared between processes. Qwen4Exp only, not
+    with embedding_across_dp; validated on DGX Spark (GB10, unified memory) only."""
 
     dp_shared_memory: bool | None = None
     """Share CPU-offloaded embedding weights between co-located
@@ -68,6 +69,11 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.embedding_across_dp and self.checkpoint_mapped:
+            raise ValueError(
+                "checkpoint_mapped does not support embedding_across_dp: its host "
+                "page prefetch only sees this DP rank's requests."
+            )
         if self.dp_shared_memory and self.checkpoint_mapped:
             raise ValueError(
                 "dp_shared_memory does not apply to checkpoint_mapped: mapped "

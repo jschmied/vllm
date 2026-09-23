@@ -17,7 +17,7 @@ from .ngram_embedding import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLEPageableHostEmbedding,
 )
-from .ple_pageable import PagePrefetcher
+from .ple_pageable import PagePrefetcher, PrefetchSource
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -141,26 +141,34 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return None
         if self._page_prefetcher_resolved:
             return self._page_prefetcher
-        tables, compute_ids = [], []
+        sources = []
         for module in self.model.modules():
             if not isinstance(module, Qwen4ExpNGramEmbedding):
                 continue
             embedding = module.ngram_embedding
             if not isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):
                 continue
-            if embedding.table is None:
-                return None  # not bound yet; retry on the next step
-            tables.append(
-                (
-                    embedding.table,
-                    embedding.shard_indices.org_vocab_start_index,
-                    embedding.shard_indices.org_vocab_end_index,
+            sources.append(
+                PrefetchSource(
+                    embedding.current_table,
+                    (
+                        embedding.shard_indices.org_vocab_start_index,
+                        embedding.shard_indices.org_vocab_end_index,
+                    ),
+                    module.cpu_ngram_ids_fn,
                 )
             )
-            compute_ids.append(module.cpu_ngram_ids_fn())
         self._page_prefetcher_resolved = True
         self._page_prefetcher = (
-            PagePrefetcher(tables, compute_ids, self.device) if tables else None
+            PagePrefetcher(
+                sources,
+                self.device,
+                self.max_num_tokens,
+                self.max_num_reqs,
+                self.ngram_context_len,
+            )
+            if sources
+            else None
         )
         return self._page_prefetcher
 

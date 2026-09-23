@@ -5,9 +5,10 @@
 On GPUs that dereference pageable host memory through the host page tables
 (``CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES``, e.g. the
 unified-memory GB10), a kernel can read a read-only ``mmap`` of the checkpoint's
-safetensors files directly. The table then needs no device memory, no pinned
-memory and no copy: its pages live in the page cache, where they are clean and
-reclaimable, and are shared by every process that maps the same files.
+safetensors files directly. There is then no table-sized device or pinned
+allocation, no resident duplicate of the table and no CPU-gather/host-to-device
+staging path: its pages live in the page cache as clean, file-backed pages that
+the kernel can drop and re-read, shared by every process mapping the same files.
 
 GPU faults on non-resident file pages are serviced one page at a time, so the
 rows a step needs are faulted in ahead of the lookup by CPU threads
@@ -195,6 +196,38 @@ def _gather_mapped_rows_kernel(
     tl.store(out_ptr + pid.to(tl.int64) * ROW_BYTES + offsets, values, mask=in_row)
 
 
+def sample_shard_rows(
+    checkpoint_start: int, shard: torch.Tensor, count: int = 3
+) -> list[tuple[int, bytes]]:
+    """A few (global row, bytes) samples of an incoming checkpoint shard."""
+    if shard.numel() == 0:
+        return []
+    rows = shard.shape[0]
+    picks = sorted({0, rows // 2, rows - 1})[:count]
+    raw = shard.detach().contiguous().view(torch.uint8).reshape(rows, -1)
+    return [(checkpoint_start + r, raw[r].cpu().numpy().tobytes()) for r in picks]
+
+
+def verify_shard_samples(
+    table: "MappedTable", samples: list[tuple[int, bytes]]
+) -> None:
+    """Raise if rows delivered by the weights source differ from the mapping.
+
+    The mapping reads the checkpoint files; weights delivered from memory (a
+    weight-sync reload) cannot be mapped and must not be silently ignored.
+    """
+    for row, expected in samples:
+        shard, local = divmod(row, table.rows_per_shard)
+        if table.views[shard][local].tobytes() != expected:
+            raise ValueError(
+                f"PLE row {row} received from the weights source differs from "
+                "the mapped checkpoint files. checkpoint_mapped reads the table "
+                "from disk and cannot load it from in-memory weights; reload "
+                "from a checkpoint on disk (weights_path) or disable "
+                "checkpoint_mapped."
+            )
+
+
 class MappedTable:
     """Read-only mappings of a layer's shards plus the GPU and CPU accessors."""
 
@@ -318,9 +351,10 @@ class MappedTable:
 class PagePrefetcher:
     """Fault in each step's PLE rows from CPU threads before the GPU reads them.
 
-    ``prepare`` copies the step's inputs to pinned buffers on the current
-    stream and returns; a worker thread waits for the copy, computes the
-    n-gram ids on the CPU, and touches the rows this rank owns.
+    ``prepare`` copies the step's inputs to pinned staging buffers on the current
+    stream and returns; a worker thread waits for the copy, computes the n-gram
+    ids on the CPU, and touches the rows this rank owns. Each source's table is
+    re-read on every step, so a remap (weight reload) takes effect here too.
     """
 
     SLOTS = 4
@@ -328,15 +362,20 @@ class PagePrefetcher:
 
     def __init__(
         self,
-        tables: list[tuple[MappedTable, int, int]],
-        compute_ids: list[Callable[..., torch.Tensor]],
+        sources: list["PrefetchSource"],
         device: torch.device,
+        max_num_tokens: int,
+        max_num_reqs: int,
+        ngram_context_len: int,
     ) -> None:
-        self.tables = tables
-        self.compute_ids = compute_ids
+        self.sources = sources
+        if device.index is None:  # e.g. torch.device("cuda"): pin to the current GPU
+            device = torch.device(device.type, torch.accelerator.current_device_index())
         self.device = device
-        # Pinned staging copies of the model state's fixed input buffers,
-        # allocated on the first step with their shapes and dtypes.
+        self.capacity = (max_num_tokens, max_num_reqs, ngram_context_len)
+        # Pinned staging slots at full capacity (allocated on the first step,
+        # with the dtypes of the model state's buffers): the per-step input_ids
+        # view changes size between steps.
         self.slots: list[tuple[torch.Tensor, ...]] = []
         self.free: queue.Queue[int] = queue.Queue()
         for i in range(self.SLOTS):
@@ -354,11 +393,25 @@ class PagePrefetcher:
         num_reqs: int,
         num_tokens: int,
     ) -> None:
+        max_tokens, max_reqs, ctx_len = self.capacity
+        if (
+            num_tokens > max_tokens
+            or num_reqs > max_reqs
+            or ngram_context.shape[1] > ctx_len
+        ):
+            logger.warning_once(
+                "PLE page prefetch skipped a step larger than its staging "
+                "capacity; lookups are unaffected"
+            )
+            return
         if not self.slots:
             self.slots = [
-                tuple(
-                    torch.empty(src.shape, dtype=src.dtype).pin_memory()
-                    for src in (input_ids, query_start_loc, ngram_context)
+                (
+                    torch.empty(max_tokens, dtype=input_ids.dtype).pin_memory(),
+                    torch.empty(max_reqs + 1, dtype=query_start_loc.dtype).pin_memory(),
+                    torch.empty(
+                        max_reqs, ctx_len, dtype=ngram_context.dtype
+                    ).pin_memory(),
                 )
                 for _ in range(self.SLOTS)
             ]
@@ -378,6 +431,14 @@ class PagePrefetcher:
         self.work.put((slot, event, num_reqs, num_tokens, ngram_context.shape[1]))
 
     def _loop(self) -> None:
+        try:
+            self._serve()
+        except Exception:
+            # Never die silently: without the prefetch, cold rows fault one page
+            # at a time on the GPU (correct, but slow).
+            logger.exception("PLE page prefetch thread stopped")
+
+    def _serve(self) -> None:
         torch.accelerator.set_device_index(self.device.index)
         while True:
             slot, event, num_reqs, num_tokens, ctx_len = self.work.get()
@@ -390,9 +451,36 @@ class PagePrefetcher:
             finally:
                 self.free.put(slot)
             try:
-                for (table, start, end), compute in zip(self.tables, self.compute_ids):
-                    rows = compute(ids, qsl, ctx).reshape(-1).numpy()
-                    rows = rows[(rows >= start) & (rows < min(end, table.num_rows))]
-                    table.touch(rows, self.pool)
+                for source in self.sources:
+                    source.touch(ids, qsl, ctx, self.pool)
             except Exception:
                 logger.exception("PLE page prefetch failed; lookups are unaffected")
+
+
+class PrefetchSource:
+    """One mapped embedding and a CPU hash of its ids, refreshed on remap."""
+
+    def __init__(
+        self,
+        get_table: Callable[[], "MappedTable | None"],
+        vocab_range: tuple[int, int],
+        make_cpu_ids: Callable[[], Callable[..., torch.Tensor]],
+    ) -> None:
+        self.get_table = get_table
+        self.vocab_range = vocab_range
+        self.make_cpu_ids = make_cpu_ids
+        self._table: MappedTable | None = None
+        self._cpu_ids: Callable[..., torch.Tensor] | None = None
+
+    def touch(self, ids, qsl, ctx, pool: ThreadPoolExecutor) -> None:
+        table = self.get_table()
+        if table is None:
+            return
+        if table is not self._table or self._cpu_ids is None:
+            # First step, or the mapping was rebuilt: refresh the CPU hash buffers.
+            self._cpu_ids = self.make_cpu_ids()
+            self._table = table
+        rows = self._cpu_ids(ids, qsl, ctx).reshape(-1).numpy()
+        start, end = self.vocab_range
+        rows = rows[(rows >= start) & (rows < min(end, table.num_rows))]
+        table.touch(rows, pool)

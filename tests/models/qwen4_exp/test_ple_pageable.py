@@ -6,18 +6,25 @@ import glob
 import json
 import os
 import struct
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
 from vllm.config.engram import EngramConfig
 from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
+from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+    Qwen4ExpPLEPageableHostEmbedding,
+)
 from vllm.models.qwen4_exp.nvidia.ple_pageable import (
     MappedTable,
+    PagePrefetcher,
+    PrefetchSource,
     discover_table_layout,
     require_pageable_access,
 )
@@ -26,8 +33,11 @@ ROW = 160
 PREFIX = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding"
 
 
-def _shard_bytes(layer: int, shard: int, rows: int, width: int) -> np.ndarray:
+def _shard_bytes(
+    layer: int, shard: int, rows: int, width: int, salt: int = 0
+) -> np.ndarray:
     base = np.arange(rows * width, dtype=np.int64) * 7 + shard * 131 + layer * 17
+    base += salt
     return base.astype(np.uint8).reshape(rows, width)
 
 
@@ -49,14 +59,14 @@ def _write(path, tensors: dict[str, tuple[str, list[int], bytes]], pad: int = 7)
         f.write(b"".join(blobs))
 
 
-def _checkpoint(tmp_path, shards_by_file, layer=1, dtype="F8_E4M3", width=ROW):
+def _checkpoint(tmp_path, shards_by_file, layer=1, dtype="F8_E4M3", width=ROW, salt=0):
     """shards_by_file: [{shard_index: rows}, ...], one dict per file."""
     for i, shards in enumerate(shards_by_file):
         tensors = {
             f"{PREFIX.format(layer=layer)}.shard_{s}.weight": (
                 dtype,
                 [rows, width // (2 if dtype == "BF16" else 1)],
-                _shard_bytes(layer, s, rows, width).tobytes(),
+                _shard_bytes(layer, s, rows, width, salt).tobytes(),
             )
             for s, rows in shards.items()
         }
@@ -186,6 +196,82 @@ def test_zero_mapping_commits_no_memory_when_read():
     assert grown_kib < 4096, f"touching 32 MiB of zeros committed {grown_kib} KiB"
 
 
+def _mapped_embedding(files_ref: dict) -> Qwen4ExpPLEPageableHostEmbedding:
+    """A CPU-only embedding with just the state binding needs."""
+    emb = object.__new__(Qwen4ExpPLEPageableHostEmbedding)
+    torch.nn.Module.__init__(emb)
+    emb.register_parameter(
+        "weight",
+        torch.nn.Parameter(
+            torch.empty(0, ROW, dtype=torch.float8_e4m3fn), requires_grad=False
+        ),
+    )
+    emb.org_vocab_size, emb.embedding_dim, emb.layer_index = 12, ROW, 1
+    emb.table, emb._rebind_pending, emb._incoming_samples = None, False, []
+    emb._prefetch_buffer = torch.empty(0)
+    emb._load_format = "auto"
+    emb._model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(split_ngram_parts=4)
+    )
+    emb._load_config = None
+    return emb
+
+
+def _mapped_rows(emb) -> np.ndarray:
+    t = emb.table
+    return np.stack(
+        [t.views[r // t.rows_per_shard][r % t.rows_per_shard] for r in range(12)]
+    )
+
+
+def test_reload_from_disk_remaps_to_the_new_checkpoint(tmp_path, monkeypatch):
+    """Load A, then reload_weights(weights_path=B): the table must follow B."""
+    shards = {0: 3, 1: 3, 2: 3, 3: 3}
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = _checkpoint(tmp_path / "a", [shards])
+    b = _checkpoint(tmp_path / "b", [shards], salt=97)
+    source = {"dir": a}
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "resolve_checkpoint_files",
+        lambda model_config, load_config: _files(source["dir"]),
+    )
+    emb = _mapped_embedding(source)
+    emb.bind_storage_after_loading()  # first load: A
+    np.testing.assert_array_equal(_mapped_rows(emb), _reference(shards))
+    # The reload streams B's shards through load_weights, then rebinds.
+    source["dir"] = b
+    for s, rows in shards.items():
+        raw = torch.from_numpy(_shard_bytes(1, s, rows, ROW, salt=97).copy())
+        emb.record_incoming_shard(s * 3, raw.view(torch.float8_e4m3fn))
+    assert emb._rebind_pending
+    emb.bind_storage_after_loading()
+    np.testing.assert_array_equal(
+        _mapped_rows(emb),
+        np.concatenate([_shard_bytes(1, s, 3, ROW, salt=97) for s in range(4)]),
+    )
+    assert not emb._rebind_pending
+
+
+def test_reload_from_memory_is_rejected(tmp_path, monkeypatch):
+    """Weights delivered from memory cannot be mapped; never serve the old table."""
+    shards = {0: 3, 1: 3, 2: 3, 3: 3}
+    a = _checkpoint(tmp_path, [shards])
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "resolve_checkpoint_files",
+        lambda model_config, load_config: _files(a),
+    )
+    emb = _mapped_embedding({})
+    emb.bind_storage_after_loading()
+    for s, rows in shards.items():  # new rows arrive from memory; files stay A
+        raw = torch.from_numpy(_shard_bytes(1, s, rows, ROW, salt=5).copy())
+        emb.record_incoming_shard(s * 3, raw.view(torch.float8_e4m3fn))
+    with pytest.raises(ValueError, match="differs from the mapped checkpoint"):
+        emb.bind_storage_after_loading()
+
+
 # ------------------------------------------------------------------- config
 
 
@@ -211,6 +297,11 @@ def test_config_rejects_architectures_without_mapped_storage(arch, monkeypatch):
 def test_config_rejects_shared_memory_with_mapping():
     with pytest.raises(ValueError, match="checkpoint_mapped"):
         EngramConfig(checkpoint_mapped=True, dp_shared_memory=True)
+
+
+def test_config_rejects_embedding_across_dp_with_mapping():
+    with pytest.raises(ValueError, match="embedding_across_dp"):
+        EngramConfig(checkpoint_mapped=True, embedding_across_dp=True)
 
 
 def test_config_does_not_default_shared_memory_when_mapped():
@@ -309,3 +400,28 @@ def test_zero_mapping_reads_zeros_without_committing_memory():
     out = torch.full((3, ROW), 0xFF, dtype=torch.uint8, device="cuda")
     table.gather_into(ids, out, 0, 1 << 20)
     assert not out.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA events")
+def test_prefetcher_staging_survives_short_then_long_steps():
+    """The per-step input_ids view changes size; staging must be at capacity."""
+    table = MappedTable.zeros(1000, ROW, torch.device("cuda"))
+    source = PrefetchSource(
+        lambda: table,
+        (0, 1000),
+        lambda: (lambda ids, qsl, ctx: torch.zeros(ids.shape[0], 16, dtype=torch.long)),
+    )
+    prefetcher = PagePrefetcher([source], torch.device("cuda"), 4096, 16, 2)
+    qsl = torch.zeros(17, dtype=torch.int32, device="cuda")
+    ctx = torch.zeros(16, 2, dtype=torch.int32, device="cuda")
+    for num_tokens in (64, 4096, 7):
+        ids = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+        qsl[1:] = num_tokens
+        prefetcher.prepare(ids, qsl, ctx, 1, num_tokens)
+        torch.accelerator.synchronize()
+        deadline = time.monotonic() + 10
+        while prefetcher.free.qsize() < prefetcher.SLOTS:  # worker released the slot
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    assert prefetcher.slots[0][0].shape[0] == 4096
+    assert prefetcher.skipped == 0

@@ -46,7 +46,13 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_ngram_ids
-from .ple_pageable import MappedTable, discover_table_layout, require_pageable_access
+from .ple_pageable import (
+    MappedTable,
+    discover_table_layout,
+    require_pageable_access,
+    sample_shard_rows,
+    verify_shard_samples,
+)
 
 logger = init_logger(__name__)
 
@@ -545,10 +551,12 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     """PLE table read in place from the checkpoint's safetensors files.
 
     For GPUs that dereference pageable host memory through the host page tables
-    (e.g. unified-memory GB10). The table occupies no device or pinned memory:
-    its rows stay in the page cache as clean, reclaimable, cross-process shared
-    file pages. The lookup and ETP reduction reuse the pinned-host side-stream
-    flow; only the storage and the gather differ.
+    (e.g. unified-memory GB10). There is no table-sized device or pinned
+    allocation and no resident duplicate of the table: its rows stay in the page
+    cache as clean, file-backed pages that the kernel can drop and re-read, shared
+    between processes. The prefetch buffer, ETP reduction and finalize path are
+    inherited from the pinned-host backend; the lookup itself runs on the current
+    stream (not the pinned backend's side stream) and gathers from the mapping.
     """
 
     def __init__(
@@ -596,6 +604,8 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._load_config = vllm_config.load_config
         self._load_format = str(vllm_config.load_config.load_format)
         self.table: MappedTable | None = None
+        self._rebind_pending = False
+        self._incoming_samples: list[tuple[int, bytes]] = []
         self._prefetch_stream = torch.cuda.Stream(device=device)
         self._prefetch_buffer = torch.empty(
             max_total_tokens * self.etp_data_parallel_size,
@@ -616,10 +626,33 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         del num_embeddings
         return torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
 
+    def current_table(self) -> MappedTable | None:
+        """The mapping in use now (rebuilt when a reload remaps the files)."""
+        return self.table
+
+    def record_incoming_shard(
+        self, checkpoint_start: int, loaded_weight: torch.Tensor
+    ) -> None:
+        """Remember a few rows of a shard delivered by a (re)load.
+
+        The table is read from the checkpoint files, not from these tensors;
+        the samples let the (re)bound mapping be checked against them, and mark
+        that the mapping must be rebuilt (e.g. ``reload_weights(weights_path)``).
+        """
+        self._rebind_pending = True
+        self._incoming_samples.extend(
+            sample_shard_rows(checkpoint_start, loaded_weight)
+        )
+
     def bind_storage_after_loading(self) -> None:
-        """Map this layer's shards once the checkpoint is on local disk."""
-        if self.table is not None:
+        """(Re)map this layer's shards once the checkpoint is on local disk."""
+        if self.table is not None and not self._rebind_pending:
             return
+        self._bind()
+
+    def _bind(self) -> None:
+        self._rebind_pending = False
+        samples, self._incoming_samples = self._incoming_samples, []
         device = self._prefetch_buffer.device
         if self._load_format == "dummy":
             self.table = MappedTable.zeros(
@@ -636,10 +669,12 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             self.weight.dtype,
             int(getattr(self._model_config.hf_text_config, "split_ngram_parts", 512)),
         )
-        self.table = MappedTable(layout, device)
+        table = MappedTable(layout, device)
+        verify_shard_samples(table, samples)
+        self.table = table
         logger.info(
             "Mapped PLE table of layer %d in place: %d rows x %d B from %d files; "
-            "no device or pinned memory",
+            "no table-sized device or pinned allocation",
             self.layer_index,
             layout.num_rows,
             layout.row_bytes,
@@ -647,6 +682,10 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         )
 
     def _lookup_on_current_stream(self, ngram_ids: torch.Tensor) -> None:
+        if self._rebind_pending:
+            # A reload delivered shards but its processing did not rebind (a
+            # layer without loadable elements is only restored): rebind now.
+            self._bind()
         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
         self._lookup(
@@ -1102,11 +1141,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
                 embedding = self.ngram_embedding
-                if isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):
-                    # Rows are read in place from the checkpoint after loading;
-                    # the layout is validated when the mapping is bound.
-                    loaded.add("ngram_embedding.weight")
-                    continue
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
                 ) // self.split_ngram_parts
@@ -1122,6 +1156,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if isinstance(embedding, Qwen4ExpPLEPageableHostEmbedding):
+                    # Rows are read in place from the checkpoint files; sample
+                    # this shard so the mapping can be checked against it.
+                    embedding.record_incoming_shard(checkpoint_start, loaded_weight)
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,

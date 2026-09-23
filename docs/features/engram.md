@@ -102,19 +102,20 @@ support; vLLM fails fast when it is unavailable.
 ## Unified-memory systems: checkpoint-mapped tables (Qwen4Exp)
 
 On a unified-memory machine such as DGX Spark (GB10, 128 GB shared by CPU and
-GPU), neither storage above fits Qwen3.8-Flash-Next: the device-resident table
-does not fit next to the weights, and a pinned host copy of its 47.7 GiB FP8
-table cannot be swapped or reclaimed, so it competes directly with the weights
-and the KV cache for the same physical memory.
+GPU), neither storage above suits Qwen3.8-Flash-Next: the device-resident table
+does not fit next to the weights, and a 47.7 GiB host copy of its FP8 table is
+anonymous memory in the same physical pool as the weights and the KV cache. It
+cannot be cheaply dropped and recreated under memory pressure.
 
 `checkpoint_mapped` instead reads the table **in place from the checkpoint's
 safetensors files**. The files are mapped read-only and the lookup kernel reads
 the mapped rows directly, which requires a GPU that accesses pageable host
 memory through the host page tables (checked at startup through
-`CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`). The table
-then uses no GPU memory, no pinned memory and no copy: its rows live in the
-page cache, where they are clean, reclaimable, and shared by every process that
-maps the same files. Because GPU page faults on rows that are not yet resident
+`CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`). There is
+then no table-sized GPU or pinned allocation, no resident duplicate of the table
+and no CPU-gather/host-to-device staging path: the rows live in the page cache
+as clean, file-backed pages that the kernel can drop and re-read, shared by every
+process that maps the same files. Because GPU page faults on rows that are not yet resident
 are serviced one page at a time, CPU threads fault in each step's rows before
 the forward pass reads them.
 
@@ -124,9 +125,11 @@ vllm serve Qwen/Qwen3.8-Flash-Next-FP8 \
 ```
 
 `checkpoint_mapped` overrides `cpu_offload`, is incompatible with
-`dp_shared_memory` (mapped pages are already shared between processes), and
-requires a safetensors checkpoint whose PLE table is stored in the dtype the
-model uses (FP8 or BF16). It is implemented for Qwen4Exp only and has been
+`dp_shared_memory` (mapped pages are already shared between processes) and with
+`embedding_across_dp`, and requires a safetensors checkpoint whose PLE table is
+stored in the dtype the model uses (FP8 or BF16). Reloading weights from disk
+(`weights_path`) remaps the new checkpoint; loading the table from in-memory
+weights (e.g. weight sync) is detected and rejected. It is implemented for Qwen4Exp only and has been
 validated only on DGX Spark; other GPUs that report the attribute (for example
 Grace Hopper or Grace Blackwell over NVLink-C2C) are accepted with a warning.
 
