@@ -660,6 +660,38 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         step, so the side stream buys no overlap worth keeping here.
         """
         self._lookup_on_current_stream(ngram_ids)
+        # LOCAL-ONLY self-check (local branch, never for review).
+        if (
+            Qwen4ExpPLEPageableHostEmbedding._selfcheck_left <= 0
+            or torch.cuda.is_current_stream_capturing()
+            or ngram_ids.shape[0] < 2
+        ):
+            return
+        Qwen4ExpPLEPageableHostEmbedding._selfcheck_left -= 1
+        import numpy as np
+
+        torch.cuda.synchronize()
+        table = self.table
+        ids = ngram_ids.reshape(-1).cpu().numpy()
+        got = (
+            self._prefetch_buffer[: ngram_ids.shape[0]]
+            .view(torch.uint8)
+            .reshape(-1, table.row_bytes)
+            .cpu()
+            .numpy()
+        )
+        ref = np.stack(
+            [table.views[r // table.rows_per_shard][r % table.rows_per_shard] for r in ids]
+        )
+        logger.info(
+            "PLE SELFCHECK: rows handed to the model match checkpoint bytes: %s "
+            "(tokens=%d, rows=%d)",
+            bool(np.array_equal(got, ref)),
+            ngram_ids.shape[0],
+            ids.size,
+        )
+
+    _selfcheck_left = int(os.environ.get("VLLM_PLE_SELFCHECK", "0"))
 
     def _lookup(
         self,
