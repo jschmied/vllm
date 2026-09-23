@@ -134,6 +134,16 @@ def _resolve_gdn_prefill_backend(
     ):
         supports_flashinfer = True
         supports_cutedsl = True
+    elif (
+        # GDN55715-PATCH: backport of vllm#55715 (merged 2026-09-08, f6326f53b).
+        # The gate covered SM90 and SM10x only, so sm_12x fell through to
+        # Triton/FLA for every linear-attention layer.
+        current_platform.is_device_capability_family(120)
+        and head_k_dim == 128
+        and current_platform.get_cuda_runtime_major() >= 13
+    ):
+        # The in-tree CuteDSL kernel targets SM100 only, so it stays off here.
+        supports_flashinfer = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"

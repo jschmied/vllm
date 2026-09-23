@@ -637,6 +637,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=vllm_config.quant_config,  # LMHEADQ (jschmied): FP8 lm_head checkpoints
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -1013,6 +1014,17 @@ class Qwen4ExpForConditionalGeneration(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
+        # ---- SCALEINV (jschmied 2026-09-03): ModelOpt FP8_PB_WO exports name the block
+        # scale `weight_scale_inv` (rank-2 [N/128, K/128]); vLLM expects `weight_scale`
+        # shaped [ob, 1, ib, 1]. Same quantity, "_inv" is a naming legacy (verified).
+        def _scaleinv(ws):
+            for name, w in ws:
+                if name.endswith("weight_scale_inv") and w.dim() == 2:
+                    yield name[: -len("_inv")], w.reshape(w.shape[0], 1, w.shape[1], 1)
+                else:
+                    yield name, w
+        weights = _scaleinv(weights)
+        # ---- end SCALEINV ----
         return loader.load_weights(weights, mapper=mapper)
 
     @classmethod

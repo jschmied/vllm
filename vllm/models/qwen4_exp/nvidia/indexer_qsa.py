@@ -450,7 +450,11 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             out,
         )
+        if _QSA_UNION_STASH:  # QSA UNION: the selection before expansion, consumed by forward_qsa in the same step
+            self._qsa_union_raw = (block_indices, compressed_metadata.logical_positions[:num_tokens], visible_blocks, out)
         return out
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]
+import os as _qsa_union_os  # QSA UNION
+_QSA_UNION_STASH = _qsa_union_os.environ.get("VLLM_QSA_UNION", "0") not in ("0", "", "false", "False")

@@ -486,11 +486,21 @@ def _topk(
         and current_platform.has_device_capability(90)
         and not current_platform.is_device_capability_family(120)
     )
-    topk_op = (
-        torch.ops._C.cooperative_topk
-        if use_cooperative_topk
-        else torch.ops._C.persistent_topk
-    )
+    # ---- QSADET (jschmied 2026-09-06, main port) ----
+    import os as _os
+    if _os.environ.get("VLLM_QSA_DET_TOPK"):
+        if not getattr(_topk, "_qsadet_loaded", False):
+            _lib = _os.environ.get("VLLM_QSA_DET_LIB", "/opt/llm/kernel-det/_C_det.so")
+            torch.ops.load_library(_lib)
+            _topk._qsadet_loaded = True
+            print(f"QSADET active: {_lib}", flush=True)
+        topk_op = torch.ops._C_det.persistent_topk
+    else:
+        topk_op = (
+            torch.ops._C.cooperative_topk
+            if use_cooperative_topk
+            else torch.ops._C.persistent_topk
+        )
     topk_op(
         logits,
         visible_blocks,

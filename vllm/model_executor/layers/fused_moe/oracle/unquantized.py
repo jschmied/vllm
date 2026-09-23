@@ -163,15 +163,22 @@ def backend_to_kernel_cls(
         raise ValueError(f"Unknown unquantized MoE backend: {backend.value}")
 
 
+_UNQUANTIZED_BACKEND_MAP = {
+    "triton": UnquantizedMoeBackend.TRITON,
+    "batched_triton": UnquantizedMoeBackend.BATCHED_TRITON,
+    "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+    "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+    "aiter": UnquantizedMoeBackend.AITER,
+}
+
+
+def has_unquantized_equivalent(runner_backend) -> bool:
+    return runner_backend in _UNQUANTIZED_BACKEND_MAP
+
+
 def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend:
     """Map user's MoEBackend to UnquantizedMoeBackend."""
-    mapping = {
-        "triton": UnquantizedMoeBackend.TRITON,
-        "batched_triton": UnquantizedMoeBackend.BATCHED_TRITON,
-        "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
-        "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
-        "aiter": UnquantizedMoeBackend.AITER,
-    }
+    mapping = _UNQUANTIZED_BACKEND_MAP
     if backend := mapping.get(runner_backend):
         return backend
     raise ValueError(
@@ -286,7 +293,14 @@ def select_unquantized_moe_backend(
     runner_backend = moe_config.moe_backend
     # 'humming' is quantization-only; an unquantized layer (e.g. excluded via
     # modules_to_not_convert) falls through to auto instead of erroring.
-    if runner_backend not in ["auto", "humming"]:
+    if runner_backend != "auto" and not has_unquantized_equivalent(runner_backend):
+        logger.info_once(
+            "GENFIX56964 moe_backend=%s is quantization-only; using auto for this "
+            "unquantized MoE layer.",
+            runner_backend,
+        )
+        runner_backend = "auto"
+    if runner_backend != "auto":
         requested_backend = map_unquantized_backend(runner_backend)
         if (
             activation_format == mk.FusedMoEActivationFormat.BatchedExperts

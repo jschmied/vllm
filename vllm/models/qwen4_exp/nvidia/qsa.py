@@ -146,8 +146,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
 
-        from .ops.qsa import qsa_sparse_paged_attention
+        from .ops.qsa import qsa_sparse_paged_attention, qsa_union_eligible  # QSA UNION
 
+        union = None
+        indexer = getattr(layer, "indexer", None)
+        if indexer is not None:
+            num_requests = int(attn_metadata.seq_lens.shape[0])
+            if qsa_union_eligible(num_tokens, num_requests, indexer.compress_ratio, indexer.token_topk):
+                union = {"compress_ratio": indexer.compress_ratio, "token_topk": indexer.token_topk,
+                         "num_requests": num_requests, "raw": getattr(indexer, "_qsa_union_raw", None)}
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -157,6 +164,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
+            union=union,
         )
         return output
 
