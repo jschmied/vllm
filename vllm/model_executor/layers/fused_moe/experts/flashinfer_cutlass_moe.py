@@ -386,6 +386,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
+            # ---- DETFIN (jschmied 2026-09-06, main port): non-fused deterministic finalize on demand
+            use_fused_finalize=not bool(__import__("os").environ.get("VLLM_MOE_DET_FINALIZE")),
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:

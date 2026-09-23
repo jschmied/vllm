@@ -385,6 +385,9 @@ class DraftModelSpeculator(BaseSpeculator):
                 "use_local_argmax_reduction is not compatible with "
                 "draft_sample_method='probabilistic'."
             )
+        _fn_attach = getattr(self.model, "_fn_attach_draft_vocab", None)
+        if _fn_attach is not None:
+            _fn_attach()
         if not hasattr(self.model, "get_top_tokens"):
             raise ValueError(
                 "use_local_argmax_reduction is enabled but draft model "

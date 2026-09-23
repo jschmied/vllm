@@ -59,6 +59,43 @@ from .model import (
 )
 
 
+
+import os as _fn_os
+from vllm.logger import init_logger as _fn_init_logger
+_fn_logger = _fn_init_logger(__name__)
+
+
+def _fn_attach_draft_vocab(model) -> None:
+    """Slice the drafter's FP8_PB_WO lm_head to the ids in FN_DRAFT_VOCAB (one per line) as an exact BF16 dequant.
+    The full head is untouched; only get_top_tokens uses the slice."""
+    path = _fn_os.environ.get("FN_DRAFT_VOCAB", "").strip()
+    if not path:
+        return
+    head = model.lm_head
+    w = getattr(head, "weight", None); s = getattr(head, "weight_scale", None)
+    if w is None or s is None or w.dim() != 2 or s.dim() != 2 or w.dtype != torch.float8_e4m3fn:
+        _fn_logger.warning("FNDV: lm_head is not a 2-D FP8 block-scaled head; skipping.")
+        return
+    if getattr(head, "tp_size", 1) != 1:
+        _fn_logger.warning("FNDV: TP>1 unsupported; skipping."); return
+    ids = sorted({int(x) for x in open(path).read().split() if x.strip()})
+    N, K = w.shape; ids = [i for i in ids if 0 <= i < N]
+    if not ids or len(ids) >= N:
+        _fn_logger.warning("FNDV: %d usable ids against %d rows; skipping.", len(ids), N); return
+    bs = getattr(head, "weight_block_size", [128, 128]); bn, bk = int(bs[0]), int(bs[1])
+    assert K % bk == 0 and s.shape[0] == (N + bn - 1) // bn and s.shape[1] == K // bk, (bs, tuple(s.shape), (N, K))
+    index = torch.tensor(ids, dtype=torch.long, device=w.device)
+    with torch.no_grad():
+        rows = w.index_select(0, index).to(torch.float32)
+        srows = s.index_select(0, index // bn).to(torch.float32)
+        deq = (rows * srows.repeat_interleave(bk, dim=1)).to(torch.bfloat16).contiguous()
+    model.register_buffer("_fn_draft_weight", deq, persistent=False)
+    model.register_buffer("_fn_draft_ids", index.to(torch.int64), persistent=False)
+    mib = lambda t: t.numel() * t.element_size() / 2**20
+    _fn_logger.info("FNDV draft vocab: %d of %d rows (%.1f%%); draft head %.0f -> %.0f MiB per draft step (BF16 slice of the FP8 head)",
+                    len(ids), N, 100.0 * len(ids) / N, mib(w) + mib(s), mib(deq))
+
+
 def _remap_ignored_layers(
     ignored_layers: list[str],
     mtp_start_layer_idx: int,
@@ -398,6 +435,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=vllm_config.quant_config,  # LMHEADQ-MTP (jschmied): FP8 lm_head checkpoints
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
@@ -436,6 +474,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft ids over the FN_DRAFT_VOCAB slice when attached (a dropped row can only cost a rejected draft,
+        never a wrong output), else the full head via the local-argmax path. Logit scale 1, no soft cap: argmax is exact."""
+        w = getattr(self, "_fn_draft_weight", None)
+        if w is None:
+            return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        logits = torch.nn.functional.linear(hidden_states.to(w.dtype), w)
+        return self._fn_draft_ids[logits.argmax(dim=-1)]
+
+    def _fn_attach_draft_vocab(self) -> None:
+        _fn_attach_draft_vocab(self)
+
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:
@@ -450,7 +501,16 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names(), mapper=mapper)
+        # ---- SCALEINV-MTP (jschmied 2026-09-04): same rename/reshape as the body loader for
+        # FP8_PB_WO `weight_scale_inv` (rank-2 [N/128, K/128] -> `weight_scale` [ob, 1, ib, 1]).
+        def _scaleinv(ws):
+            for name, w in ws:
+                if name.endswith("weight_scale_inv") and w.dim() == 2:
+                    yield name[: -len("_inv")], w.reshape(w.shape[0], 1, w.shape[1], 1)
+                else:
+                    yield name, w
+        return loader.load_weights(_scaleinv(remap_weight_names()), mapper=mapper)
+        # ---- end SCALEINV-MTP ----
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

@@ -487,6 +487,23 @@ class VocabParallelEmbedding(PluggableLayer):
         start_idx = self.shard_indices.org_vocab_start_index
         shard_size = self.shard_indices.org_vocab_end_index - start_idx
 
+        # LMHEADSCALE (jschmied 2026-09-03): block scales of a block-quantized
+        # head ([vocab/bn, 1, hidden/bk, 1], KFp8PbWo) shard along the vocab
+        # dim in units of the block size, not the vocab.
+        if param.data.ndim == 4 and loaded_weight.ndim == 4:
+            rows = loaded_weight.shape[output_dim]
+            block = self.org_vocab_size // rows
+            assert block * rows == self.org_vocab_size, (
+                f"block scale rows {rows} do not tile vocab {self.org_vocab_size}"
+            )
+            assert start_idx % block == 0 and shard_size % block == 0
+            loaded_weight = loaded_weight.narrow(
+                output_dim, start_idx // block, shard_size // block
+            )
+            param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+            param[loaded_weight.shape[0] :].data.fill_(0)
+            return
+
         # If param packed on the same dim we are sharding on, then
         # need to adjust offsets of loaded weight by pack_factor.
         if packed_dim is not None and packed_dim == output_dim:

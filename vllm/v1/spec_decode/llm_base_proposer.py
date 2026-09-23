@@ -1613,6 +1613,9 @@ class SpecDecodeBaseProposer:
                 "Using local argmax reduction for draft token generation "
                 "(communication: O(2*tp_size) vs O(vocab_size))."
             )
+            _fn_attach = getattr(self.model, "_fn_attach_draft_vocab", None)
+            if _fn_attach is not None:
+                _fn_attach()
 
     @torch.inference_mode()
     def dummy_run(
