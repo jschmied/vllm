@@ -3324,20 +3324,18 @@ class VllmConfig:
 
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
         # FNRSSM (local): GDN RecoverSSM for Qwen4Exp on the KDA RecoverSSM plumbing. Selection is separate from
-        # validation: the target config (num_speculative_tokens > 0) selects it; a derived config that shares
-        # cache_config with num_speculative_tokens == 0 (the MTP drafter's) keeps the target's choice. Both run the
-        # same checks as the KDA path below.
+        # validation: the target config (Qwen4ExpForConditionalGeneration, num_speculative_tokens > 0) selects it.
+        # Every later config that shares cache_config keeps that choice: the MTP drafter's derived config
+        # (architecture Qwen4ExpMTP, and it carries the speculative config too) would otherwise reach the
+        # ReplaySSM branch below and switch it off. Every config that keeps it runs the same checks as the KDA path.
         if os.environ.get("FN_GDN_RECOVERSSM", "") == "1":
-            is_qwen_gdn_target = (
+            if (
                 self.num_speculative_tokens > 0
                 and self.model_config is not None
                 and self.model_config.architecture == "Qwen4ExpForConditionalGeneration"
-            )
-            if is_qwen_gdn_target:
-                self.cache_config.use_kda_recoverssm = True
-            if self.cache_config.use_kda_recoverssm and (
-                is_qwen_gdn_target or self.num_speculative_tokens == 0
             ):
+                self.cache_config.use_kda_recoverssm = True
+            if self.cache_config.use_kda_recoverssm:
                 self._validate_recoverssm_runtime()
                 return self
         if not self.cache_config.use_replayssm:
