@@ -26,6 +26,39 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
 logger = init_logger(__name__)
 
 
+def recoverssm_spec_rows(
+    is_prefilling_cpu: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_decode_draft_tokens_cpu: torch.Tensor,
+    num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Which batch rows take the RecoverSSM spec path, shared by the GDN and PLE builders.
+
+    Every active decode row does (a draft-less step is a window of one token), plus every row that has drafts.
+    Only the first ``num_reqs`` rows are real; padding rows never take the spec path. Returns the draft-count vector
+    to hand to the base builder (1 for spec rows, -1 otherwise, padding included) and the spec rows in batch order,
+    which is also the order of the base builder's spec state indices.
+    """
+    query_lens = query_start_loc_cpu[: num_reqs + 1].diff()
+    active_decode = (~is_prefilling_cpu[:num_reqs]) & (query_lens > 0)
+    spec_mask = (num_decode_draft_tokens_cpu[:num_reqs] >= 0) | active_decode
+    drafts = torch.full_like(num_decode_draft_tokens_cpu, -1)
+    drafts[:num_reqs] = torch.where(spec_mask, 1, -1).to(drafts.dtype)
+    return drafts, spec_mask.nonzero().flatten()
+
+
+def recoverssm_request_indices(rows: torch.Tensor, num_spec_decodes: int, device: torch.device) -> torch.Tensor | None:
+    """None when the spec rows are exactly 0..n-1, else their batch rows (the commit plan's request mapping).
+    Raises if the base builder counted a different number of spec rows than the classification above."""
+    if rows.numel() != num_spec_decodes:
+        raise ValueError(
+            f"RecoverSSM: {rows.numel()} spec rows classified, but the builder produced {num_spec_decodes}"
+        )
+    if num_spec_decodes == 0 or int(rows[-1]) == num_spec_decodes - 1:
+        return None
+    return rows.to(torch.int32).to(device, non_blocking=True)
+
+
 @dataclass
 class GDNRecoverSSMCommitMetadata:
     state_indices: torch.Tensor          # [num_spec_decodes, 1]
@@ -82,16 +115,14 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, num_accepted_tokens=None,
               num_decode_draft_tokens_cpu=None, fast_build=False):  # type: ignore[override]
         m = common_attn_metadata
-        spec_mask_cpu = None
+        rows = None
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
-            assert m.is_prefilling is not None and m.is_prefilling.device.type == "cpu"
-            active_decode = (~m.is_prefilling) & (m.query_start_loc_cpu.diff() > 0)
-            spec_mask_cpu = (num_decode_draft_tokens_cpu >= 0) | active_decode
+            if m.is_prefilling is None or m.is_prefilling.device.type != "cpu":
+                raise ValueError("GDN RecoverSSM needs the CPU is_prefilling mask")
             # Positive counts only defeat the base builder's "no drafts -> regular decode" shortcut:
             # RecoverSSM keeps every post-prefill row on the spec path (extended conv window).
-            num_decode_draft_tokens_cpu = torch.where(
-                spec_mask_cpu, torch.ones_like(num_decode_draft_tokens_cpu),
-                torch.full_like(num_decode_draft_tokens_cpu, -1))
+            num_decode_draft_tokens_cpu, rows = recoverssm_spec_rows(
+                m.is_prefilling, m.query_start_loc_cpu, num_decode_draft_tokens_cpu, m.num_reqs)
         meta = super().build(common_prefix_len, m, num_accepted_tokens=num_accepted_tokens,
                              num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu, fast_build=fast_build)
         base = {f.name: getattr(meta, f.name) for f in fields(meta)}
@@ -100,10 +131,9 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
             n = meta.num_spec_decodes
             base["spec_state_indices_tensor"] = meta.spec_state_indices_tensor[:, :1]
             base["num_accepted_tokens"] = self._ones[:n]
-            rows = spec_mask_cpu.nonzero().flatten()
-            contiguous = bool(rows.numel() == n and (n == 0 or int(rows[-1]) == n - 1))
-            request_indices = None if contiguous else rows.to(torch.int32).to(m.query_start_loc.device,
-                                                                                non_blocking=True)
+            if rows is None:
+                raise ValueError("GDN RecoverSSM: spec rows without draft counts")
+            request_indices = recoverssm_request_indices(rows, n, m.query_start_loc.device)
             align = self.vllm_config.cache_config.mamba_cache_mode == "align"
             commit = GDNRecoverSSMCommitMetadata(
                 state_indices=base["spec_state_indices_tensor"],

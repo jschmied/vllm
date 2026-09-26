@@ -134,3 +134,118 @@ def test_context_rejects_inconsistent_layers():
     with pytest.raises(ValueError, match="block count"):
         GDNRecoverSSMCommitContext.from_tensors([conv[:5]], [ck], [inp["replay_cache"]], spec_query_len=T,
                                                 max_num_reqs=8)
+
+
+# ------------------------------------------------------------------ review round 2: mapping, align, extreme gates
+from vllm.v1.attention.backends.gdn_recoverssm import (  # noqa: E402
+    recoverssm_request_indices,
+    recoverssm_spec_rows,
+)
+
+GATES = {  # (A_log range, a scale, b offset): drive g = -exp(A_log) * softplus(a + dt_bias) and beta = sigmoid(b)
+    "typical": (0.0, 1.0, 0.0),
+    "g_near_0": (-12.0, 1.0, 0.0),
+    "g_very_negative": (2.5, 4.0, 0.0),
+    "beta_near_0": (0.0, 1.0, -12.0),
+    "beta_near_1": (0.0, 1.0, 12.0),
+}
+
+
+def _make(qlens, nb=16, seed=0, gate="typical"):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
+    alog, ascale, boff = GATES[gate]
+    tot = sum(qlens)
+    qsl = torch.tensor([0, *torch.tensor(qlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    return dict(
+        A_log=(torch.rand(HV, device="cuda", generator=g) * 2 - 1 + alog).float(),
+        a=(rnd(tot, HV) * ascale).bfloat16(),
+        b=(rnd(tot, HV) + boff).bfloat16(),
+        dt_bias=(rnd(HV) * 0.5).bfloat16(),
+        q=rnd(1, tot, H, K).bfloat16(), k=rnd(1, tot, H, K).bfloat16(), v=rnd(1, tot, HV, V).bfloat16(),
+        checkpoint_state=(rnd(nb, HV, V, K) * 0.05).float(),
+        replay_cache=torch.zeros(nb, HV, T, V + K + 1, device="cuda"),
+        query_start_loc=qsl, spec_query_len=T,
+    )
+
+
+def test_spec_rows_mixed_batch():
+    # rows: 0 spec K=3 | 1 prefill | 2 draft-less decode | 3 spec K=1 | 4 padded zero-query | 5,6 beyond num_reqs
+    is_prefilling = torch.tensor([False, True, False, False, False, False, False])
+    qsl = torch.tensor([0, 4, 104, 105, 107, 107], dtype=torch.int32)
+    drafts_in = torch.tensor([3, -1, -1, 1, -1, 2, 0], dtype=torch.int32)   # 5, 6: garbage padding
+    drafts, rows = recoverssm_spec_rows(is_prefilling, qsl, drafts_in, num_reqs=5)
+    assert rows.tolist() == [0, 2, 3]
+    assert drafts.tolist() == [1, -1, 1, 1, -1, -1, -1]
+    idx = recoverssm_request_indices(rows, 3, torch.device("cuda"))
+    assert idx is not None and idx.tolist() == [0, 2, 3]
+    assert recoverssm_request_indices(torch.tensor([0, 1, 2]), 3, torch.device("cuda")) is None
+    with pytest.raises(ValueError, match="spec rows classified"):
+        recoverssm_request_indices(rows, 2, torch.device("cuda"))
+
+
+def test_commit_maps_noncontiguous_requests_in_align_mode():
+    """Spec rows 0, 2, 3 of a 5-request batch; accepted counts, block table and num_computed are indexed by
+    request row. Every spec request must commit its own state into its own block."""
+    qlens = [4, 1, 2]                                  # the spec rows' windows (K=3, draft-less, K=1)
+    inp = _make(qlens, nb=40)
+    bs = 8
+    bt = torch.arange(1, 1 + 5 * 6, dtype=torch.int32, device="cuda").reshape(5, 6)   # request row -> blocks
+    nc = torch.tensor([5, 0, 16, 9, 0], dtype=torch.int32, device="cuda")               # per request row
+    req_rows = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+    src = torch.stack([bt[r, int(nc[r]) // bs] for r in req_rows.tolist()]).contiguous()
+    inp["state_indices"] = src
+    _verify(inp)
+    _, states = _native(inp)
+    ckpt = inp["checkpoint_state"].clone()
+    ctx = _context(inp, ckpt)
+    acc = torch.tensor([3, 9, 1, 2, 9], dtype=torch.int32, device="cuda")                # rows 1, 4 must be ignored
+    ctx.commit(acc, src, inp["query_start_loc"], request_indices=req_rows, block_table=bt,
+               num_computed_tokens=nc, mamba_block_size=bs)
+    for i, r in enumerate(req_rows.tolist()):
+        n = min(int(acc[r]), qlens[i]); c0 = int(nc[r])
+        final_blk = int(bt[r, (c0 + n) // bs])
+        tok = int(inp["query_start_loc"][i]) + n - 1
+        torch.testing.assert_close(ckpt[final_blk], states[tok], rtol=1e-5, atol=1e-6)
+
+
+# (num_computed, accepted, block size): boundary after 1 / after 2 / ending exactly on it / crossing and continuing /
+# accepted = 1 without crossing / the full window crossing after 3
+ALIGN_CASES = [(3, 2, 4), (2, 3, 4), (0, 4, 4), (6, 4, 4), (1, 1, 4), (5, 4, 8), (7, 4, 8), (4, 4, 8)]
+
+
+@pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
+def test_align_boundary_and_final_state_match_native(nc, accepted, bs):
+    inp = _make([T], nb=12)
+    bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
+    src = bt[0, nc // bs].reshape(1).contiguous()
+    inp["state_indices"] = src
+    _verify(inp)
+    _, states = _native(inp)
+    ckpt = inp["checkpoint_state"].clone()
+    ctx = _context(inp, ckpt)
+    ctx.commit(torch.tensor([accepted], dtype=torch.int32, device="cuda"), src, inp["query_start_loc"],
+               block_table=bt, num_computed_tokens=torch.tensor([nc], dtype=torch.int32, device="cuda"),
+               mamba_block_size=bs)
+    next_boundary = (nc // bs + 1) * bs
+    final_blk = int(bt[0, (nc + accepted) // bs])
+    if nc + accepted >= next_boundary:                  # crosses: the boundary state goes into the source block
+        torch.testing.assert_close(ckpt[int(src)], states[next_boundary - nc - 1], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(ckpt[final_blk], states[accepted - 1], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("gate", list(GATES))
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_commit_matches_native_under_extreme_gates(gate, seed):
+    inp = _make(list(QLENS), nb=10, seed=seed, gate=gate)
+    inp["state_indices"] = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
+    _verify(inp)
+    _, states = _native(inp)
+    for accepted in (1, 2, 3, 4):
+        ckpt = inp["checkpoint_state"].clone()
+        ctx = _context(inp, ckpt)
+        acc = torch.tensor([min(accepted, q) for q in QLENS], dtype=torch.int32, device="cuda")
+        ctx.commit(acc, inp["state_indices"], inp["query_start_loc"])
+        for i, blk in enumerate(inp["state_indices"].tolist()):
+            tok = int(inp["query_start_loc"][i]) + int(acc[i]) - 1
+            torch.testing.assert_close(ckpt[blk], states[tok], rtol=1e-5, atol=1e-6)

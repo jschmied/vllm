@@ -3306,25 +3306,40 @@ class VllmConfig:
         return self
 
     @model_validator(mode="after")
+    def _validate_recoverssm_runtime(self) -> None:
+        """FNRSSM: the runtime checks of the KDA RecoverSSM path, shared with GDN RecoverSSM."""
+        if self.mamba_config.enable_stochastic_rounding:
+            raise ValueError(
+                "RecoverSSM supports bfloat16/float32 SSM state caches, not "
+                "--enable-mamba-cache-stochastic-rounding"
+            )
+        if self.cache_config.mamba_cache_mode not in ("none", "align"):
+            raise ValueError("RecoverSSM supports only none and align Mamba cache modes")
+        if self.cache_config.mamba_cache_mode == "align" and not self.use_v2_model_runner:
+            raise ValueError("RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError("RecoverSSM currently requires pipeline_parallel_size=1")
+        if self.mamba_config.backend != MambaBackendEnum.TRITON:
+            raise ValueError("RecoverSSM requires --mamba-backend triton")
+
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
-        # FNRSSM sticky: derived configs (the MTP drafter's) share cache_config and re-validate with
-        # num_speculative_tokens == 0; they must not switch the target's RecoverSSM off again.
-        if os.environ.get("FN_GDN_RECOVERSSM", "") == "1" and self.cache_config.use_kda_recoverssm:
-            return self
-        # FNRSSM (jschmied 2026-09-25, local): GDN RecoverSSM for Qwen4Exp, reusing the KDA RecoverSSM plumbing.
-        if (
-            os.environ.get("FN_GDN_RECOVERSSM", "") == "1"
-            and self.num_speculative_tokens > 0
-            and self.model_config is not None
-            and self.model_config.architecture == "Qwen4ExpForConditionalGeneration"
-        ):
-            if self.cache_config.mamba_cache_mode not in ("none", "align"):
-                raise ValueError("FN_GDN_RECOVERSSM supports mamba_cache_mode none and align")
-            if self.cache_config.mamba_cache_mode == "align" and not self.use_v2_model_runner:
-                raise ValueError("FN_GDN_RECOVERSSM with align mode requires the V2 model runner")
-            # FNRSSM2: align mode supported (PLE short conv on the RecoverSSM protocol)
-            self.cache_config.use_kda_recoverssm = True
-            return self
+        # FNRSSM (local): GDN RecoverSSM for Qwen4Exp on the KDA RecoverSSM plumbing. Selection is separate from
+        # validation: the target config (num_speculative_tokens > 0) selects it; a derived config that shares
+        # cache_config with num_speculative_tokens == 0 (the MTP drafter's) keeps the target's choice. Both run the
+        # same checks as the KDA path below.
+        if os.environ.get("FN_GDN_RECOVERSSM", "") == "1":
+            is_qwen_gdn_target = (
+                self.num_speculative_tokens > 0
+                and self.model_config is not None
+                and self.model_config.architecture == "Qwen4ExpForConditionalGeneration"
+            )
+            if is_qwen_gdn_target:
+                self.cache_config.use_kda_recoverssm = True
+            if self.cache_config.use_kda_recoverssm and (
+                is_qwen_gdn_target or self.num_speculative_tokens == 0
+            ):
+                self._validate_recoverssm_runtime()
+                return self
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
             return self

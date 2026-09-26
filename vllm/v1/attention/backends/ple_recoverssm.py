@@ -21,6 +21,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
     PleShortConvAttentionMetadataBuilder,
 )
+from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import _require
+from vllm.v1.attention.backends.gdn_recoverssm import recoverssm_request_indices, recoverssm_spec_rows
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
@@ -29,14 +31,19 @@ logger = init_logger(__name__)
 class _PleConvCommit:
     def __init__(self, conv_states, spec_query_len: int, max_num_reqs: int):
         from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+        _require(len(conv_states) > 0, "PLE commit requires at least one layer")  # FNRSSMGUARD
         if not is_conv_state_dim_first():
             conv_states = [s.transpose(-1, -2) for s in conv_states]   # -> [blocks, C, W]
         self.conv_states = list(conv_states)
         ref = self.conv_states[0]
+        _require(ref.ndim == 3, "PLE conv state must be [blocks, dim, window]")
         dev = ref.device
+        for s in self.conv_states:
+            _require(s.shape == ref.shape and s.dtype == ref.dtype and s.stride()[1:] == ref.stride()[1:]
+                     and s.device == dev, "PLE layers need matching conv states")
         self.conv_dim, conv_len = ref.shape[1], ref.shape[2]
         self.hist = conv_len - spec_query_len + 1
-        assert self.hist > 0
+        _require(self.hist > 0, "PLE conv state is shorter than its window")
         self.spec_query_len = spec_query_len
         t = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)
         self.base = t([s.data_ptr() for s in self.conv_states])
@@ -52,6 +59,23 @@ class _PleConvCommit:
         batch = state_indices.shape[0]
         if batch == 0:
             return
+        _require(state_indices.ndim == 1, "state indices must be one-dimensional")  # FNRSSMGUARD
+        _require(batch <= self.commit_lens.shape[0], "PLE commit batch exceeds its plan capacity")
+        _require(query_start_loc.ndim == 1 and query_start_loc.shape[0] == batch + 1, "PLE commit metadata is incompatible")
+        _require(request_indices is None or request_indices.shape[0] >= batch, "PLE request mapping is too short")
+        _require(num_accepted_tokens.ndim == 1
+                 and (request_indices is not None or num_accepted_tokens.shape[0] >= batch),
+                 "PLE accepted-token counts are too short")
+        _align = (block_table, num_computed_tokens, mamba_block_size)
+        _require(all(x is None for x in _align) or all(x is not None for x in _align),
+                 "PLE align metadata is incomplete")
+        _require(mamba_block_size is None or mamba_block_size >= self.spec_query_len,
+                 "PLE align block size must cover one speculative window")
+        _require(block_table is None or block_table.ndim == 2, "PLE block table must be two-dimensional")
+        _dev = self.conv_states[0].device
+        _require(all(t_ is None or t_.device == _dev for t_ in (num_accepted_tokens, state_indices, query_start_loc,
+                                                                request_indices, block_table, num_computed_tokens)),
+                 "PLE commit inputs must be on the same device")
         bt = (0, 0) if block_table is None else block_table.stride()
         _prepare_commit_plan_kernel[(batch,)](
             num_accepted_tokens, request_indices, state_indices, query_start_loc, block_table, num_computed_tokens,
@@ -116,14 +140,13 @@ class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False, *, num_accepted_tokens=None,
               num_decode_draft_tokens_cpu=None, **kwargs):  # type: ignore[override]
         m = common_attn_metadata
-        spec_mask_cpu = None
+        rows = None
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
-            assert m.is_prefilling is not None and m.is_prefilling.device.type == "cpu"
-            active_decode = (~m.is_prefilling[: m.num_reqs]) & (m.query_start_loc_cpu.diff() > 0)
-            spec_mask_cpu = (num_decode_draft_tokens_cpu[: m.num_reqs] >= 0) | active_decode
-            drafts = torch.full_like(num_decode_draft_tokens_cpu, -1)
-            drafts[: m.num_reqs] = torch.where(spec_mask_cpu, 1, -1).to(drafts.dtype)
-            num_decode_draft_tokens_cpu = drafts
+            if m.is_prefilling is None or m.is_prefilling.device.type != "cpu":
+                raise ValueError("PLE RecoverSSM needs the CPU is_prefilling mask")
+            # the same classification as the GDN builder, so both commits map the same requests
+            num_decode_draft_tokens_cpu, rows = recoverssm_spec_rows(
+                m.is_prefilling, m.query_start_loc_cpu, num_decode_draft_tokens_cpu, m.num_reqs)
         meta = super().build(common_prefix_len, m, fast_build, num_accepted_tokens=num_accepted_tokens,
                              num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu, **kwargs)
         if not isinstance(meta, PleShortConvAttentionMetadata) or meta.num_spec_decodes == 0:
@@ -131,9 +154,9 @@ class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
         base = {f.name: getattr(meta, f.name) for f in fields(meta)}
         n = meta.num_spec_decodes
         base["num_accepted_tokens"] = self._ones[:n]
-        rows = spec_mask_cpu.nonzero().flatten()
-        contiguous = bool(rows.numel() == n and int(rows[-1]) == n - 1)
-        req_idx = None if contiguous else rows.to(torch.int32).to(m.query_start_loc.device, non_blocking=True)
+        if rows is None:
+            raise ValueError("PLE RecoverSSM: spec rows without draft counts")
+        req_idx = recoverssm_request_indices(rows, n, m.query_start_loc.device)
         align = self.vllm_config.cache_config.mamba_cache_mode == "align"
         commit = PleRecoverSSMCommitMetadata(
             state_indices=meta.spec_state_indices_tensor, query_start_loc=meta.spec_query_start_loc,

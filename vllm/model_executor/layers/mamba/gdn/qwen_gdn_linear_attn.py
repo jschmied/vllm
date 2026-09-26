@@ -370,9 +370,11 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-    def get_state_shape(
-        self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    def _uses_gdn_recoverssm(self) -> bool:
+        """FNRSSM: one predicate for the replay state's shape, dtype and the attention backend."""
+        return bool(getattr(self.cache_config, "use_kda_recoverssm", False)) and self.num_spec > 0
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
@@ -382,7 +384,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
-        if getattr(self.cache_config, "use_kda_recoverssm", False) and self.num_spec > 0:
+        if self._uses_gdn_recoverssm():
             # FNRSSM: per-token replay record [HV, spec_query_len, V + K + 1] fp32
             shapes = (*shapes, (self.num_v_heads // self.tp_size, self.num_spec + 1,
                                 self.head_v_dim + self.head_k_dim + 1))
@@ -390,12 +392,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         dtypes = super().get_state_dtype()
-        if getattr(self.cache_config, "use_kda_recoverssm", False) and self.num_spec > 0:
+        if self._uses_gdn_recoverssm():
             dtypes = (*dtypes, torch.float32)  # FNRSSM
         return dtypes
 
     def get_attn_backend(self):
-        if getattr(self.cache_config, "use_kda_recoverssm", False) and self.num_spec > 0:
+        if self._uses_gdn_recoverssm():
             from vllm.v1.attention.backends.gdn_recoverssm import GDNRecoverSSMAttentionBackend
             return GDNRecoverSSMAttentionBackend  # FNRSSM
         return super().get_attn_backend()

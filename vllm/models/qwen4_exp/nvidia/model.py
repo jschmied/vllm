@@ -747,22 +747,32 @@ class Qwen4ExpForCausalLM(
         )
 
     @classmethod
+    def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
+        """FNRSSM: one predicate for the replay record's shape AND dtype (they must agree for the MambaSpec)."""
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return bool(vllm_config.cache_config.use_kda_recoverssm) and num_spec > 0
+
+    @classmethod
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
-        if vllm_config.cache_config.use_kda_recoverssm:  # FNRSSM
+        if cls._uses_gdn_recoverssm(vllm_config):  # FNRSSM: replay record, fp32
             dtypes = (*dtypes, torch.float32)
         return dtypes
 
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -780,7 +790,7 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
-        if vllm_config.cache_config.use_kda_recoverssm and num_spec > 0:  # FNRSSM
+        if cls._uses_gdn_recoverssm(vllm_config):  # FNRSSM: replay record [HV, spec_query_len, V + K + 1]
             shapes = (*shapes, (hf_config.linear_num_value_heads // tp_size, num_spec + 1,
                                 hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1))
         return shapes
@@ -789,13 +799,13 @@ class Qwen4ExpForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
