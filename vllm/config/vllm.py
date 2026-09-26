@@ -3305,7 +3305,6 @@ class VllmConfig:
             )
         return self
 
-    @model_validator(mode="after")
     def _validate_recoverssm_runtime(self) -> None:
         """FNRSSM: the runtime checks of the KDA RecoverSSM path, shared with GDN RecoverSSM."""
         if self.mamba_config.enable_stochastic_rounding:
@@ -3322,6 +3321,7 @@ class VllmConfig:
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError("RecoverSSM requires --mamba-backend triton")
 
+    @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
         # FNRSSM (local): GDN RecoverSSM for Qwen4Exp on the KDA RecoverSSM plumbing. Selection is separate from
         # validation: the target config (Qwen4ExpForConditionalGeneration, num_speculative_tokens > 0) selects it.
