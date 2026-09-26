@@ -175,6 +175,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return True
 
     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
+        if getattr(self.cache_config, "use_kda_recoverssm", False) and self.num_spec_tokens > 0:
+            from vllm.v1.attention.backends.ple_recoverssm import PleRecoverSSMAttentionBackend
+            return PleRecoverSSMAttentionBackend  # FNRSSM2
         return PleShortConvAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:

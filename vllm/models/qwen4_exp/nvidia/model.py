@@ -750,11 +750,14 @@ class Qwen4ExpForCausalLM(
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
+        if vllm_config.cache_config.use_kda_recoverssm:  # FNRSSM
+            dtypes = (*dtypes, torch.float32)
+        return dtypes
 
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
@@ -768,7 +771,7 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -777,6 +780,10 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
+        if vllm_config.cache_config.use_kda_recoverssm and num_spec > 0:  # FNRSSM
+            shapes = (*shapes, (hf_config.linear_num_value_heads // tp_size, num_spec + 1,
+                                hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1))
+        return shapes
 
     @classmethod
     def get_mamba_state_dtype_from_config(

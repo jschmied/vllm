@@ -79,6 +79,7 @@ class MambaBase(AttentionLayerBase):
             num_speculative_blocks=(
                 0
                 if vllm_config.cache_config.use_kda_recoverssm
+                # FNRSSM2: the PLE short conv follows the RecoverSSM protocol too (one block, compacted window)
                 else vllm_config.num_speculative_tokens
             ),
         )
