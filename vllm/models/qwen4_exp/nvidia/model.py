@@ -754,7 +754,8 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        return bool(vllm_config.cache_config.use_kda_recoverssm) and num_spec > 0
+        from vllm.model_executor.layers.mamba.ops.recoverssm_common import uses_recoverssm
+        return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
 
     @classmethod
     def get_gdn_mamba_state_dtype_from_config(

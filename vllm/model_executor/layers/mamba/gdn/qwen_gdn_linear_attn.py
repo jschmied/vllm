@@ -372,7 +372,8 @@ class ChunkGatedDeltaRule(CustomOp):
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _uses_gdn_recoverssm(self) -> bool:
         """FNRSSM: one predicate for the replay state's shape, dtype and the attention backend."""
-        return bool(getattr(self.cache_config, "use_kda_recoverssm", False)) and self.num_spec > 0
+        from vllm.model_executor.layers.mamba.ops.recoverssm_common import uses_recoverssm
+        return uses_recoverssm(self.cache_config, self.num_spec)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
@@ -550,7 +551,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         # FNRSSM: RecoverSSM verify replaces the per-draft snapshot path (Triton decode only)
-        self.use_gdn_recoverssm = bool(getattr(self.cache_config, "use_kda_recoverssm", False)) and self.num_spec > 0
+        self.use_gdn_recoverssm = self._uses_gdn_recoverssm()
         if self.use_gdn_recoverssm:
             self.gdn_decode_kernel = "triton"
             self.enable_fused_gdn_decode = False

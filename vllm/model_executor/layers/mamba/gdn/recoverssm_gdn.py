@@ -17,13 +17,14 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+    compact_conv_state_kernel, prepare_commit_plan_kernel, recoverssm_require)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 def _require(cond: bool, msg: str) -> None:  # FNRSSMGUARD: boundary checks as in the KDA RecoverSSM ops
-    if not cond:
-        raise ValueError(f"GDN RecoverSSM: {msg}")
+    recoverssm_require(cond, msg, "GDN RecoverSSM")
 
 
 @triton.jit
@@ -292,8 +293,6 @@ class GDNRecoverSSMCommitContext:
                block_table: torch.Tensor | None = None, num_computed_tokens: torch.Tensor | None = None,
                mamba_block_size: int | None = None, commit_conv: bool = True) -> None:
         """Fold accepted GDN and convolution inputs into every layer's checkpoint."""
-        from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
-            _compact_conv_state_kernel, _prepare_commit_plan_kernel)
         batch = state_indices.shape[0]
         if batch == 0:
             return
@@ -314,7 +313,7 @@ class GDNRecoverSSMCommitContext:
                                                                 request_indices, block_table, num_computed_tokens)),
                  "commit inputs must be on the same device")
         bt_stride = (0, 0) if block_table is None else block_table.stride()
-        _prepare_commit_plan_kernel[(batch,)](
+        prepare_commit_plan_kernel[(batch,)](
             num_accepted_tokens, request_indices, state_indices, query_start_loc, block_table, num_computed_tokens,
             self.commit_lens, self.final_state_indices, self.boundary_state_indices, self.boundary_recovery_lens,
             NULL_BLOCK_ID, mamba_block_size or 1, block_table.shape[1] if block_table is not None else 1,
@@ -326,7 +325,7 @@ class GDNRecoverSSMCommitContext:
         if commit_conv:
             conv_ref = self.conv_states[0]
             conv_dim = conv_ref.shape[1]
-            _compact_conv_state_kernel[(triton.cdiv(conv_dim, 256), batch, num_layers)](
+            compact_conv_state_kernel[(triton.cdiv(conv_dim, 256), batch, num_layers)](
                 conv_ref, self.conv_state_base_addrs, self.conv_state_block_strides, self.conv_state_dim_strides,
                 self.conv_state_token_strides, state_indices, self.commit_lens, self.final_state_indices,
                 self.boundary_state_indices, self.boundary_recovery_lens, NULL_BLOCK_ID, conv_dim,

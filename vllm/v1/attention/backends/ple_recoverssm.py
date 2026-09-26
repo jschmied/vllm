@@ -5,7 +5,7 @@
 When the GDN layers run RecoverSSM, the runner resets the shared num_accepted_tokens to 1 after each commit (align
 mode). The PLE dilated short conv keeps an extended window in one state block and reads it at num_accepted - 1, so
 it must follow the same protocol: every active decode row takes the spec path, the conv reads at offset 0, and after
-sampling the accepted window is compacted to the front (generic Kimi-K3 compaction kernel; in align mode it also
+sampling the accepted window is compacted to the front (the shared RecoverSSM compaction kernel; in align mode it also
 writes the block-boundary window).
 """
 from dataclasses import dataclass, field, fields
@@ -21,11 +21,16 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
     PleShortConvAttentionMetadataBuilder,
 )
-from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import _require
+from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+    compact_conv_state_kernel, prepare_commit_plan_kernel, recoverssm_require)
 from vllm.v1.attention.backends.gdn_recoverssm import recoverssm_request_indices, recoverssm_spec_rows
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 logger = init_logger(__name__)
+
+
+def _require(cond: bool, msg: str) -> None:
+    recoverssm_require(cond, msg, "PLE RecoverSSM")
 
 
 class _PleConvCommit:
@@ -55,7 +60,6 @@ class _PleConvCommit:
 
     def commit(self, num_accepted_tokens, state_indices, query_start_loc, request_indices=None,
                block_table=None, num_computed_tokens=None, mamba_block_size=None):
-        from vllm.models.kimi_k3.nvidia.ops.recoverssm import _compact_conv_state_kernel, _prepare_commit_plan_kernel
         batch = state_indices.shape[0]
         if batch == 0:
             return
@@ -77,7 +81,7 @@ class _PleConvCommit:
                                                                 request_indices, block_table, num_computed_tokens)),
                  "PLE commit inputs must be on the same device")
         bt = (0, 0) if block_table is None else block_table.stride()
-        _prepare_commit_plan_kernel[(batch,)](
+        prepare_commit_plan_kernel[(batch,)](
             num_accepted_tokens, request_indices, state_indices, query_start_loc, block_table, num_computed_tokens,
             self.commit_lens, self.final_idx, self.bnd_idx, self.bnd_len, NULL_BLOCK_ID, mamba_block_size or 1,
             block_table.shape[1] if block_table is not None else 1, num_accepted_tokens.stride(0),
@@ -85,7 +89,7 @@ class _PleConvCommit:
             query_start_loc.stride(0), bt[0], bt[1],
             0 if num_computed_tokens is None else num_computed_tokens.stride(0),
             SPEC_QUERY_LEN=self.spec_query_len, num_warps=1)
-        _compact_conv_state_kernel[(triton.cdiv(self.conv_dim, 256), batch, len(self.conv_states))](
+        compact_conv_state_kernel[(triton.cdiv(self.conv_dim, 256), batch, len(self.conv_states))](
             self.conv_states[0], self.base, self.bstride, self.dstride, self.tstride, state_indices,
             self.commit_lens, self.final_idx, self.bnd_idx, self.bnd_len, NULL_BLOCK_ID, self.conv_dim, self.hist,
             state_indices.stride(0), BLOCK_D=256, BLOCK_HISTORY=triton.next_power_of_2(self.hist),
