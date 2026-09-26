@@ -748,13 +748,17 @@ class Qwen4ExpForCausalLM(
 
     @classmethod
     def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
-        """FNRSSM: one predicate for the replay record's shape AND dtype (they must agree for the MambaSpec)."""
+        """FNRSSM: one predicate for the replay record's shape AND dtype (they must
+        agree for the MambaSpec)."""
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config
             else 0
         )
-        from vllm.model_executor.layers.mamba.ops.recoverssm_common import uses_recoverssm
+        from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+            uses_recoverssm,
+        )
+
         return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
 
     @classmethod
@@ -791,9 +795,17 @@ class Qwen4ExpForCausalLM(
             hf_config.linear_conv_kernel_dim,
             num_spec,
         )
-        if cls._uses_gdn_recoverssm(vllm_config):  # FNRSSM: replay record [HV, spec_query_len, V + K + 1]
-            shapes = (*shapes, (hf_config.linear_num_value_heads // tp_size, num_spec + 1,
-                                hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1))
+        if cls._uses_gdn_recoverssm(
+            vllm_config
+        ):  # FNRSSM: replay record [HV, spec_query_len, V + K + 1]
+            shapes = (
+                *shapes,
+                (
+                    hf_config.linear_num_value_heads // tp_size,
+                    num_spec + 1,
+                    hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1,
+                ),
+            )
         return shapes
 
     @classmethod

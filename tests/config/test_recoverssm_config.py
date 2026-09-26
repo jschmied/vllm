@@ -46,8 +46,8 @@ def _config(arch: str, cache_config=None, num_spec: int = 3, **overrides):
             setattr(getattr(cfg, target), attr, value)
         else:
             setattr(cfg, target, value)
-    cfg._validate_recoverssm_runtime = (
-        lambda: VllmConfig._validate_recoverssm_runtime(cfg)
+    cfg._validate_recoverssm_runtime = lambda: VllmConfig._validate_recoverssm_runtime(
+        cfg
     )
     return cfg
 
@@ -75,7 +75,9 @@ def test_derived_drafter_runs_the_runtime_checks(monkeypatch):
     target = _config(TARGET)
     _validator()(target)
     drafter = _config(
-        DRAFTER, cache_config=target.cache_config, parallel_config__pipeline_parallel_size=2
+        DRAFTER,
+        cache_config=target.cache_config,
+        parallel_config__pipeline_parallel_size=2,
     )
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
         _validator()(drafter)

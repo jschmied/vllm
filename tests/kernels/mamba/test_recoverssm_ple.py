@@ -41,9 +41,9 @@ def _setup(seed, blocks):
     outer = torch.randn_like(x)
     raw, view = _state()
     for b in blocks:
-        view[b, :, :STATE_LEN] = torch.randn(
-            C, STATE_LEN, generator=g, device=DEV
-        ).to(torch.bfloat16)
+        view[b, :, :STATE_LEN] = torch.randn(C, STATE_LEN, generator=g, device=DEV).to(
+            torch.bfloat16
+        )
     return w, x, outer, raw, view
 
 

@@ -371,8 +371,12 @@ class ChunkGatedDeltaRule(CustomOp):
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _uses_gdn_recoverssm(self) -> bool:
-        """FNRSSM: one predicate for the replay state's shape, dtype and the attention backend."""
-        from vllm.model_executor.layers.mamba.ops.recoverssm_common import uses_recoverssm
+        """FNRSSM: one predicate for the replay state's shape, dtype and the attention
+        backend."""
+        from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+            uses_recoverssm,
+        )
+
         return uses_recoverssm(self.cache_config, self.num_spec)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
@@ -387,8 +391,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if self._uses_gdn_recoverssm():
             # FNRSSM: per-token replay record [HV, spec_query_len, V + K + 1] fp32
-            shapes = (*shapes, (self.num_v_heads // self.tp_size, self.num_spec + 1,
-                                self.head_v_dim + self.head_k_dim + 1))
+            shapes = (
+                *shapes,
+                (
+                    self.num_v_heads // self.tp_size,
+                    self.num_spec + 1,
+                    self.head_v_dim + self.head_k_dim + 1,
+                ),
+            )
         return shapes
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
@@ -399,7 +409,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_attn_backend(self):
         if self._uses_gdn_recoverssm():
-            from vllm.v1.attention.backends.gdn_recoverssm import GDNRecoverSSMAttentionBackend
+            from vllm.v1.attention.backends.gdn_recoverssm import (
+                GDNRecoverSSMAttentionBackend,
+            )
+
             return GDNRecoverSSMAttentionBackend  # FNRSSM
         return super().get_attn_backend()
 
@@ -550,14 +563,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gdn_decode_kernel = "XPU"
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
-        # FNRSSM: RecoverSSM verify replaces the per-draft snapshot path (Triton decode only)
+        # FNRSSM: RecoverSSM verify replaces the per-draft snapshot path (Triton decode
+        # only)
         self.use_gdn_recoverssm = self._uses_gdn_recoverssm()
         if self.use_gdn_recoverssm:
             self.gdn_decode_kernel = "triton"
             self.enable_fused_gdn_decode = False
             self.enable_packed_recurrent_decode = False
-            logger.warning_once("FNRSSM: GDN RecoverSSM speculative verify active (spec_query_len %d)",
-                                self.num_spec + 1)
+            logger.warning_once(
+                "FNRSSM: GDN RecoverSSM speculative verify active (spec_query_len %d)",
+                self.num_spec + 1,
+            )
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -1113,7 +1129,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        state_dtype = self.get_state_dtype()[1]  # FNRSSM: 3 dtypes with the replay record
+        state_dtype = self.get_state_dtype()[
+            1
+        ]  # FNRSSM: 3 dtypes with the replay record
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1371,8 +1389,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=(self.num_spec + 1 if getattr(self, "use_gdn_recoverssm", False)  # FNRSSM
-                               else spec_state_indices_tensor.size(-1)),
+                max_query_len=(
+                    self.num_spec + 1
+                    if getattr(self, "use_gdn_recoverssm", False)  # FNRSSM
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -1409,18 +1430,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        # RecoverSSM verify reads token-strided heads: view the conv output instead of copying it.
+        # RecoverSSM verify reads token-strided heads: view the conv output instead of
+        # copying it. The views need a 2-D [tokens, q|k|v] layout with a contiguous last
+        # dimension; any other layout falls back to the contiguous copies.
         verify_views = (
             spec_sequence_masks is not None
             and mixed_qkv_spec is not None
             and self.use_gdn_recoverssm
+            and mixed_qkv_spec.ndim == 2
+            and mixed_qkv_spec.stride(-1) == 1
         )
         if verify_views:
             q_dim = self.key_dim // self.tp_size
             v_dim = self.value_dim // self.tp_size
             num_spec_tokens = mixed_qkv_spec.shape[0]
-            query_spec = mixed_qkv_spec[:, :q_dim].view(1, num_spec_tokens, -1, self.head_k_dim)
-            key_spec = mixed_qkv_spec[:, q_dim : 2 * q_dim].view(1, num_spec_tokens, -1, self.head_k_dim)
+            query_spec = mixed_qkv_spec[:, :q_dim].view(
+                1, num_spec_tokens, -1, self.head_k_dim
+            )
+            key_spec = mixed_qkv_spec[:, q_dim : 2 * q_dim].view(
+                1, num_spec_tokens, -1, self.head_k_dim
+            )
             value_spec = mixed_qkv_spec[:, 2 * q_dim : 2 * q_dim + v_dim].view(
                 1, num_spec_tokens, -1, self.head_v_dim
             )
@@ -1488,20 +1517,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None and getattr(self, "use_gdn_recoverssm", False):
-            # FNRSSM: verify the window off the checkpoint; the commit after sampling writes the state once
-            from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import gdn_recoverssm_verify
+        if spec_sequence_masks is not None and getattr(
+            self, "use_gdn_recoverssm", False
+        ):
+            # FNRSSM: verify the window off the checkpoint; the commit after sampling
+            # writes the state once
+            from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
+                gdn_recoverssm_verify,
+            )
+
             _n = attn_metadata.num_spec_decodes
             core_attn_out_spec = gdn_recoverssm_verify(
-                self.A_log, a_spec, b_spec, self.dt_bias, query_spec, key_spec, value_spec,
-                checkpoint_state=ssm_state, replay_cache=self_kv_cache[2],
+                self.A_log,
+                a_spec,
+                b_spec,
+                self.dt_bias,
+                query_spec,
+                key_spec,
+                value_spec,
+                checkpoint_state=ssm_state,
+                replay_cache=self_kv_cache[2],
                 query_start_loc=spec_query_start_loc[: _n + 1],
                 state_indices=spec_state_indices_tensor[:_n, 0],
-                spec_query_len=self.num_spec + 1, use_qk_l2norm_in_kernel=True,
+                spec_query_len=self.num_spec + 1,
+                use_qk_l2norm_in_kernel=True,
                 # spec-only batch: write straight into the layer output
-                out=(core_attn_out[:num_actual_tokens].unsqueeze(0)
-                     if verify_views and mixed_qkv_non_spec is None
-                     and query_spec.shape[1] == num_actual_tokens else None))
+                out=(
+                    core_attn_out[:num_actual_tokens].unsqueeze(0)
+                    if verify_views
+                    and mixed_qkv_non_spec is None
+                    and query_spec.shape[1] == num_actual_tokens
+                    else None
+                ),
+            )
             last_recurrent_state = None
         elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (

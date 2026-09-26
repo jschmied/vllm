@@ -2,19 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-independent RecoverSSM pieces shared by every recurrent-state implementation.
 
-RecoverSSM verifies a speculative window from a read-only checkpoint and, after sampling, commits the accepted
-prefix once. The per-model parts (the KDA and GDN verify kernels and their state reconstruction) live with their
-models; what they share is here:
+RecoverSSM verifies a speculative window from a read-only checkpoint and, after
+sampling, commits the accepted prefix once. The per-model parts (the KDA and GDN verify
+kernels and their state reconstruction) live with their models; what they share is here:
 
-- ``prepare_commit_plan_kernel``: per request, the commit length and the destination state blocks (final and, in
-  align mode, the block-boundary block) from the accepted counts and the block table;
-- ``compact_conv_state_kernel``: moves the accepted suffix of an extended short-conv window to the front of the
-  destination block (and writes the boundary window in align mode);
+- ``prepare_commit_plan_kernel``: per request, the commit length and the destination
+  state blocks (final and, in align mode, the block-boundary block) from the accepted
+  counts and the block table;
+- ``compact_conv_state_kernel``: moves the accepted suffix of an extended short-conv
+  window to the front of the destination block (and writes the boundary window in align
+  mode);
 - ``uses_recoverssm``: the one activation predicate for layers, models and backends;
-- ``recoverssm_require``: argument validation that raises ``ValueError`` before any raw-pointer launch.
-"""
-
-import torch
+- ``recoverssm_require``: argument validation that raises ``ValueError`` before any
+  raw-pointer launch."""
 
 from vllm.triton_utils import tl, triton
 
@@ -27,9 +27,13 @@ def recoverssm_require(cond: bool, msg: str, component: str = "RecoverSSM") -> N
 def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     """True when this model instance runs RecoverSSM for its recurrent states.
 
-    ``cache_config.use_kda_recoverssm`` is the historical name of the switch: VllmConfig sets it for Kimi-K3 KDA and
-    for Qwen GDN/PLE alike. Without speculative tokens there is nothing to recover, so the stock path runs."""
-    return bool(getattr(cache_config, "use_kda_recoverssm", False)) and num_speculative_tokens > 0
+    ``cache_config.use_kda_recoverssm`` is the historical name of the switch: VllmConfig
+    sets it for Kimi-K3 KDA and for Qwen GDN/PLE alike. Without speculative tokens there
+    is nothing to recover, so the stock path runs."""
+    return (
+        bool(getattr(cache_config, "use_kda_recoverssm", False))
+        and num_speculative_tokens > 0
+    )
 
 
 @triton.heuristics(

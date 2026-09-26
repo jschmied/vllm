@@ -3306,16 +3306,24 @@ class VllmConfig:
         return self
 
     def _validate_recoverssm_runtime(self) -> None:
-        """FNRSSM: the runtime checks of the KDA RecoverSSM path, shared with GDN RecoverSSM."""
+        """FNRSSM: the runtime checks of the KDA RecoverSSM path, shared with GDN
+        RecoverSSM."""
         if self.mamba_config.enable_stochastic_rounding:
             raise ValueError(
                 "RecoverSSM supports bfloat16/float32 SSM state caches, not "
                 "--enable-mamba-cache-stochastic-rounding"
             )
         if self.cache_config.mamba_cache_mode not in ("none", "align"):
-            raise ValueError("RecoverSSM supports only none and align Mamba cache modes")
-        if self.cache_config.mamba_cache_mode == "align" and not self.use_v2_model_runner:
-            raise ValueError("RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1")
+            raise ValueError(
+                "RecoverSSM supports only none and align Mamba cache modes"
+            )
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and not self.use_v2_model_runner
+        ):
+            raise ValueError(
+                "RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1"
+            )
         if self.parallel_config.pipeline_parallel_size > 1:
             raise ValueError("RecoverSSM currently requires pipeline_parallel_size=1")
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
@@ -3323,11 +3331,14 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
-        # FNRSSM (local): GDN RecoverSSM for Qwen4Exp on the KDA RecoverSSM plumbing. Selection is separate from
-        # validation: the target config (Qwen4ExpForConditionalGeneration, num_speculative_tokens > 0) selects it.
-        # Every later config that shares cache_config keeps that choice: the MTP drafter's derived config
-        # (architecture Qwen4ExpMTP, and it carries the speculative config too) would otherwise reach the
-        # ReplaySSM branch below and switch it off. Every config that keeps it runs the same checks as the KDA path.
+        # FNRSSM (local): GDN RecoverSSM for Qwen4Exp on the KDA RecoverSSM plumbing.
+        # Selection is separate from validation: the target config
+        # (Qwen4ExpForConditionalGeneration, num_speculative_tokens > 0) selects it.
+        # Every later config that shares cache_config keeps that choice: the MTP
+        # drafter's derived config (architecture Qwen4ExpMTP, and it carries the
+        # speculative config too) would otherwise reach the ReplaySSM branch below and
+        # switch it off. Every config that keeps it runs the same checks as the KDA
+        # path.
         if os.environ.get("FN_GDN_RECOVERSSM", "") == "1":
             if (
                 self.num_speculative_tokens > 0
