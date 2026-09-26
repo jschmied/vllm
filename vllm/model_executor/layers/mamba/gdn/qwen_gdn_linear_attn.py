@@ -373,9 +373,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _uses_gdn_recoverssm(self) -> bool:
         """FNRSSM: one predicate for the replay state's shape, dtype and the attention
         backend."""
-        from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
-            uses_recoverssm,
-        )
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
 
         return uses_recoverssm(self.cache_config, self.num_spec)
 
@@ -843,6 +841,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
         return mixed_qkv_out, z_out, b_out, a_out
+
+    def _recoverssm_verify_qkv(self, mixed_qkv):
+        """Q/K/V for the RecoverSSM verify.
+
+        The verify kernel reads token-strided heads, so for a 2-D [tokens, q|k|v] conv
+        output with a contiguous last dimension it gets views instead of copies. Any
+        other layout falls back to the contiguous copies of rearrange_mixed_qkv().
+        Returns (query, key, value, is_view)."""
+        if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
+            return (*self.rearrange_mixed_qkv(mixed_qkv), False)
+        q_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        num_tokens = mixed_qkv.shape[0]
+        query = mixed_qkv[:, :q_dim].view(1, num_tokens, -1, self.head_k_dim)
+        key = mixed_qkv[:, q_dim : 2 * q_dim].view(1, num_tokens, -1, self.head_k_dim)
+        value = mixed_qkv[:, 2 * q_dim : 2 * q_dim + v_dim].view(
+            1, num_tokens, -1, self.head_v_dim
+        )
+        return query, key, value, True
 
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
@@ -1430,30 +1447,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        # RecoverSSM verify reads token-strided heads: view the conv output instead of
-        # copying it. The views need a 2-D [tokens, q|k|v] layout with a contiguous last
-        # dimension; any other layout falls back to the contiguous copies.
-        verify_views = (
+        if (
             spec_sequence_masks is not None
             and mixed_qkv_spec is not None
             and self.use_gdn_recoverssm
-            and mixed_qkv_spec.ndim == 2
-            and mixed_qkv_spec.stride(-1) == 1
-        )
-        if verify_views:
-            q_dim = self.key_dim // self.tp_size
-            v_dim = self.value_dim // self.tp_size
-            num_spec_tokens = mixed_qkv_spec.shape[0]
-            query_spec = mixed_qkv_spec[:, :q_dim].view(
-                1, num_spec_tokens, -1, self.head_k_dim
-            )
-            key_spec = mixed_qkv_spec[:, q_dim : 2 * q_dim].view(
-                1, num_spec_tokens, -1, self.head_k_dim
-            )
-            value_spec = mixed_qkv_spec[:, 2 * q_dim : 2 * q_dim + v_dim].view(
-                1, num_spec_tokens, -1, self.head_v_dim
+        ):
+            query_spec, key_spec, value_spec, verify_views = (
+                self._recoverssm_verify_qkv(mixed_qkv_spec)
             )
         else:
+            verify_views = False
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently

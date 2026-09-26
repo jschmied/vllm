@@ -3345,21 +3345,21 @@ class VllmConfig:
                 and self.model_config is not None
                 and self.model_config.architecture == "Qwen4ExpForConditionalGeneration"
             ):
-                self.cache_config.use_kda_recoverssm = True
-            if self.cache_config.use_kda_recoverssm:
+                self.cache_config.use_recoverssm = True
+            if self.cache_config.use_recoverssm:
                 self._validate_recoverssm_runtime()
                 return self
         if not self.cache_config.use_replayssm:
-            self.cache_config.use_kda_recoverssm = False
+            self.cache_config.use_recoverssm = False
             return self
-        self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
+        self.cache_config.use_recoverssm = self.num_speculative_tokens > 0
 
         if self.model_config is not None and not self.model_config.supports_replayssm:
             raise ValueError(
                 "--use-replayssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
-        if self.cache_config.use_kda_recoverssm:
+        if self.cache_config.use_recoverssm:
             if self.model_config is not None and self.model_config.architecture not in (
                 "KimiLinearForCausalLM",
                 "KimiK3ForConditionalGeneration",

@@ -472,3 +472,35 @@ def test_verify_on_strided_views_with_variable_query_lengths():
     _, got_replay = run(*views, out=core[:T].unsqueeze(0))
     assert torch.equal(core[:T].unsqueeze(0), want_out)
     assert torch.equal(got_replay, want_replay)
+
+
+def test_layer_verify_qkv_views_and_fallback():
+    """The layer's guard: views for a [tokens, q|k|v] conv output with a contiguous
+    last dimension, the contiguous-copy fallback for any other layout; same values
+    either way."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention as Layer,
+    )
+
+    H, HV, K, V, T = 4, 8, 16, 16, 5
+    layer = SimpleNamespace(
+        key_dim=H * K, value_dim=HV * V, tp_size=1, head_k_dim=K, head_v_dim=V
+    )
+    layer.rearrange_mixed_qkv = lambda x: Layer.rearrange_mixed_qkv(layer, x)
+    width = 2 * H * K + HV * V
+    packed = torch.randn(T, width + HV * V, dtype=torch.bfloat16)  # q|k|v|z, like qkvz
+    strided = packed[:, :width]
+    q, k, v, is_view = Layer._recoverssm_verify_qkv(layer, strided)
+    assert is_view
+    assert q.data_ptr() == packed.data_ptr()
+    rq, rk, rv = Layer.rearrange_mixed_qkv(layer, strided)
+    assert torch.equal(q, rq) and torch.equal(k, rk) and torch.equal(v, rv)
+
+    # Column-major storage: last dimension not contiguous -> copies, same values.
+    col_major = strided.t().contiguous().t()
+    assert col_major.stride(-1) != 1
+    q2, k2, v2, is_view2 = Layer._recoverssm_verify_qkv(layer, col_major)
+    assert not is_view2
+    assert torch.equal(q2, rq) and torch.equal(k2, rk) and torch.equal(v2, rv)

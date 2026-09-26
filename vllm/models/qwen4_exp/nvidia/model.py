@@ -755,9 +755,7 @@ class Qwen4ExpForCausalLM(
             if vllm_config.speculative_config
             else 0
         )
-        from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
-            uses_recoverssm,
-        )
+        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
 
         return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
 

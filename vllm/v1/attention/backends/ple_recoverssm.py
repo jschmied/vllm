@@ -16,11 +16,11 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+from vllm.model_executor.layers.mamba.ops.recoverssm import (
     compact_conv_state_kernel,
     prepare_commit_plan_kernel,
-    recoverssm_require,
 )
+from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_require
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,

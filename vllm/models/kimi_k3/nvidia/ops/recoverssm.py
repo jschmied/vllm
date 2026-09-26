@@ -9,10 +9,10 @@ from typing import Any
 import torch
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
-from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+from vllm.model_executor.layers.mamba.ops.recoverssm import (
     compact_conv_state_kernel as _compact_conv_state_kernel,
 )
-from vllm.model_executor.layers.mamba.ops.recoverssm_common import (
+from vllm.model_executor.layers.mamba.ops.recoverssm import (
     prepare_commit_plan_kernel as _prepare_commit_plan_kernel,
 )
 from vllm.triton_utils import tl, triton

@@ -15,7 +15,7 @@ import pytest
 
 from vllm.config.mamba import MambaBackendEnum
 from vllm.config.vllm import VllmConfig
-from vllm.model_executor.layers.mamba.ops.recoverssm_common import uses_recoverssm
+from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
 
 TARGET = "Qwen4ExpForConditionalGeneration"
 DRAFTER = "Qwen4ExpMTP"
@@ -32,7 +32,7 @@ def _config(arch: str, cache_config=None, num_spec: int = 3, **overrides):
         model_config=SimpleNamespace(architecture=arch, supports_replayssm=False),
         cache_config=cache_config
         or SimpleNamespace(
-            use_kda_recoverssm=False, use_replayssm=False, mamba_cache_mode="align"
+            use_recoverssm=False, use_replayssm=False, mamba_cache_mode="align"
         ),
         mamba_config=SimpleNamespace(
             enable_stochastic_rounding=False, backend=MambaBackendEnum.TRITON
@@ -62,12 +62,12 @@ def test_target_then_derived_drafter_keep_the_choice(monkeypatch):
     monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
     target = _config(TARGET)
     _validator()(target)
-    assert target.cache_config.use_kda_recoverssm is True
+    assert target.cache_config.use_recoverssm is True
 
     # The drafter's derived config shares cache_config and must keep the choice.
     drafter = _config(DRAFTER, cache_config=target.cache_config)
     _validator()(drafter)
-    assert target.cache_config.use_kda_recoverssm is True
+    assert target.cache_config.use_recoverssm is True
 
 
 def test_derived_drafter_runs_the_runtime_checks(monkeypatch):
@@ -104,7 +104,7 @@ def test_flag_unset_keeps_the_stock_path(monkeypatch):
     monkeypatch.delenv("FN_GDN_RECOVERSSM", raising=False)
     cfg = _config(TARGET)
     _validator()(cfg)
-    assert cfg.cache_config.use_kda_recoverssm is False
+    assert cfg.cache_config.use_recoverssm is False
     assert not uses_recoverssm(cfg.cache_config, 3)
 
 
@@ -112,21 +112,21 @@ def test_no_speculative_tokens_is_not_selected(monkeypatch):
     monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
     cfg = _config(TARGET, num_spec=0)
     _validator()(cfg)
-    assert cfg.cache_config.use_kda_recoverssm is False
+    assert cfg.cache_config.use_recoverssm is False
 
 
 def test_other_architectures_are_not_selected(monkeypatch):
     monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
     cfg = _config("Qwen3NextForCausalLM")
     _validator()(cfg)
-    assert cfg.cache_config.use_kda_recoverssm is False
+    assert cfg.cache_config.use_recoverssm is False
 
 
 def test_uses_recoverssm_predicate():
-    on = SimpleNamespace(use_kda_recoverssm=True)
+    on = SimpleNamespace(use_recoverssm=True)
     assert uses_recoverssm(on, 3)
     assert not uses_recoverssm(on, 0)
-    assert not uses_recoverssm(SimpleNamespace(use_kda_recoverssm=False), 3)
+    assert not uses_recoverssm(SimpleNamespace(use_recoverssm=False), 3)
     assert not uses_recoverssm(SimpleNamespace(), 3)
 
 
