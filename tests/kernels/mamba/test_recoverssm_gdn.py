@@ -249,3 +249,42 @@ def test_commit_matches_native_under_extreme_gates(gate, seed):
         for i, blk in enumerate(inp["state_indices"].tolist()):
             tok = int(inp["query_start_loc"][i]) + int(acc[i]) - 1
             torch.testing.assert_close(ckpt[blk], states[tok], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_verify_on_strided_views_writes_in_place(batch):
+    """The layer passes views of the packed conv output (token stride = the packed width) and the
+    layer's output buffer; result and replay record must equal the contiguous-copy path."""
+    torch.manual_seed(batch)
+    H, HV, K, V, SQ, NB = 16, 48, 128, 128, 4, 6
+    T = batch * SQ
+    qd, vd = H * K, HV * V
+    packed = torch.randn(T, 2 * qd + 2 * vd, device="cuda", dtype=torch.bfloat16)
+    mixed = packed[:, : 2 * qd + vd]
+    a = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(HV, device="cuda")
+    dt_bias = torch.randn(HV, device="cuda")
+    checkpoint = torch.randn(NB, HV, V, K, device="cuda") * 0.05
+    qsl = torch.arange(0, T + 1, SQ, device="cuda", dtype=torch.int32)
+    si = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+
+    def run(q, k, v, out=None):
+        replay = torch.zeros(NB, HV, SQ, V + K + 1, device="cuda")
+        o = gdn_recoverssm_verify(
+            A_log, a, b, dt_bias, q, k, v, checkpoint_state=checkpoint,
+            replay_cache=replay, query_start_loc=qsl, state_indices=si,
+            spec_query_len=SQ, out=out)
+        return o, replay
+
+    q, k, v = (x.contiguous().view(1, T, -1, d) for x, d in zip(
+        torch.split(mixed, [qd, qd, vd], dim=-1), (K, K, V)))
+    want_out, want_replay = run(q, k, v)
+
+    core = torch.zeros(T + 3, HV, V, device="cuda", dtype=torch.bfloat16)
+    views = (mixed[:, :qd].view(1, T, -1, K), mixed[:, qd : 2 * qd].view(1, T, -1, K),
+             mixed[:, 2 * qd :].view(1, T, -1, V))
+    got_out, got_replay = run(*views, out=core[:T].unsqueeze(0))
+    assert got_out.data_ptr() == core.data_ptr()
+    assert torch.equal(core[:T].unsqueeze(0), want_out)
+    assert torch.equal(got_replay, want_replay)

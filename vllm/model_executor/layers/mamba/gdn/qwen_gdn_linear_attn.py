@@ -1409,7 +1409,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        # RecoverSSM verify reads token-strided heads: view the conv output instead of copying it.
+        verify_views = (
+            spec_sequence_masks is not None
+            and mixed_qkv_spec is not None
+            and self.use_gdn_recoverssm
+        )
+        if verify_views:
+            q_dim = self.key_dim // self.tp_size
+            v_dim = self.value_dim // self.tp_size
+            num_spec_tokens = mixed_qkv_spec.shape[0]
+            query_spec = mixed_qkv_spec[:, :q_dim].view(1, num_spec_tokens, -1, self.head_k_dim)
+            key_spec = mixed_qkv_spec[:, q_dim : 2 * q_dim].view(1, num_spec_tokens, -1, self.head_k_dim)
+            value_spec = mixed_qkv_spec[:, 2 * q_dim : 2 * q_dim + v_dim].view(
+                1, num_spec_tokens, -1, self.head_v_dim
+            )
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1481,7 +1497,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 checkpoint_state=ssm_state, replay_cache=self_kv_cache[2],
                 query_start_loc=spec_query_start_loc[: _n + 1],
                 state_indices=spec_state_indices_tensor[:_n, 0],
-                spec_query_len=self.num_spec + 1, use_qk_l2norm_in_kernel=True)
+                spec_query_len=self.num_spec + 1, use_qk_l2norm_in_kernel=True,
+                # spec-only batch: write straight into the layer output
+                out=(core_attn_out[:num_actual_tokens].unsqueeze(0)
+                     if verify_views and mixed_qkv_non_spec is None
+                     and query_spec.shape[1] == num_actual_tokens else None))
             last_recurrent_state = None
         elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
@@ -1598,7 +1618,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
             )
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
