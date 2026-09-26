@@ -504,3 +504,94 @@ def test_layer_verify_qkv_views_and_fallback():
     q2, k2, v2, is_view2 = Layer._recoverssm_verify_qkv(layer, col_major)
     assert not is_view2
     assert torch.equal(q2, rq) and torch.equal(k2, rk) and torch.equal(v2, rv)
+
+
+# ------------------------------------------------------------- BF16 recurrent state
+# RecoverSSM upcasts the BF16 checkpoint, carries the accepted window in FP32 and rounds
+# once when it writes the committed state. The reference is the FP32 trajectory from the
+# same (already BF16-rounded) checkpoint; the committed state must equal its BF16
+# rounding up to one BF16 ulp, and be no further from it than the native path is.
+BF16_ULP = 2**-7
+
+
+def _bf16_case(qlens, nb=12, seed=0):
+    inp = _make(qlens, nb=nb, seed=seed)
+    inp["checkpoint_state"] = inp["checkpoint_state"].bfloat16()
+    ref = dict(inp)
+    ref["checkpoint_state"] = inp["checkpoint_state"].float()
+    return inp, ref
+
+
+def test_verify_bf16_state_matches_native():
+    inp, _ = _bf16_case(list(QLENS))
+    inp["state_indices"] = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
+    before = inp["checkpoint_state"].clone()
+    out = _verify(inp)
+    ref, _ = _native(inp)
+    torch.testing.assert_close(
+        out.float(), ref.reshape(out.shape).float(), rtol=0, atol=0
+    )
+    assert torch.equal(inp["checkpoint_state"], before)
+
+
+@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_commit_bf16_state_rounds_once(accepted, seed):
+    inp, ref_inp = _bf16_case(list(QLENS), seed=seed)
+    idx = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
+    inp["state_indices"] = ref_inp["state_indices"] = idx
+    _verify(inp)
+    _, native_states = _native(inp)
+    _, ref_states = _native(ref_inp)
+    ckpt = inp["checkpoint_state"].clone()
+    _context(inp, ckpt).commit(
+        torch.tensor(
+            [min(accepted, q) for q in QLENS], dtype=torch.int32, device="cuda"
+        ),
+        idx,
+        inp["query_start_loc"],
+    )
+    for i, blk in enumerate(idx.tolist()):
+        tok = int(inp["query_start_loc"][i]) + min(accepted, QLENS[i]) - 1
+        ref = ref_states[tok].float()
+        got = ckpt[blk].float()
+        torch.testing.assert_close(
+            got, ref.bfloat16().float(), rtol=BF16_ULP, atol=1e-5
+        )
+        err_rssm = (got - ref).abs().mean()
+        err_native = (native_states[tok].bfloat16().float() - ref).abs().mean()
+        assert err_rssm <= err_native * 1.05 + 1e-7, (err_rssm, err_native)
+
+
+@pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
+def test_align_boundary_bf16_state(nc, accepted, bs):
+    inp, ref_inp = _bf16_case([T])
+    bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
+    src = bt[0, nc // bs].reshape(1).contiguous()
+    inp["state_indices"] = ref_inp["state_indices"] = src
+    _verify(inp)
+    _, ref_states = _native(ref_inp)
+    ckpt = inp["checkpoint_state"].clone()
+    _context(inp, ckpt).commit(
+        torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+        src,
+        inp["query_start_loc"],
+        block_table=bt,
+        num_computed_tokens=torch.tensor([nc], dtype=torch.int32, device="cuda"),
+        mamba_block_size=bs,
+    )
+    next_boundary = (nc // bs + 1) * bs
+    final_blk = int(bt[0, (nc + accepted) // bs])
+    if nc + accepted >= next_boundary:
+        torch.testing.assert_close(
+            ckpt[int(src)].float(),
+            ref_states[next_boundary - nc - 1].float().bfloat16().float(),
+            rtol=BF16_ULP,
+            atol=1e-5,
+        )
+    torch.testing.assert_close(
+        ckpt[final_blk].float(),
+        ref_states[accepted - 1].float().bfloat16().float(),
+        rtol=BF16_ULP,
+        atol=1e-5,
+    )
