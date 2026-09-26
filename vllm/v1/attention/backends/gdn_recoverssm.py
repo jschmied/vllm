@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
     GDNAttentionMetadata,
@@ -64,6 +65,7 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
         )
         if c.block_table is None:
             return None
+        assert c.block_size is not None and c.num_computed_tokens is not None
         return RecoverSSMPostprocessMetadata(
             num_spec_decodes=n,
             request_indices=c.request_indices,
@@ -74,16 +76,17 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
 
 
 class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+    # The verify/commit metadata is not staged for FULL graph replay yet; declaring
+    # NEVER makes the runner fall back to PIECEWISE (attention compiled piecewise).
+    _cudagraph_support = AttentionCGSupport.NEVER
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if self.use_full_cuda_graph:
-            raise ValueError(
-                "GDN RecoverSSM supports PIECEWISE CUDA graphs only "
-                "(no FULL decode graphs yet)"
-            )
+        # The builder may be created before the runner resolves the CUDA graph mode.
+        self.use_full_cuda_graph = False
         max_reqs = vllm_config.scheduler_config.max_num_seqs
         self._ones = torch.ones(max_reqs, dtype=torch.int32, device=device)
-        self._context = None
+        self._context: Any = None
         self._logged = False
 
     def _get_context(self):
@@ -99,21 +102,21 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_query_len=1 + self.num_spec,
                 max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
             )
-            logger.warning(
+            logger.info(
                 "GDN RecoverSSM commit context: %d layers, spec_query_len %d",
                 len(layers),
                 1 + self.num_spec,
             )
         return self._context
 
-    def build(
+    def build(  # type: ignore[override]
         self,
-        common_prefix_len,
-        common_attn_metadata,
-        num_accepted_tokens=None,
-        num_decode_draft_tokens_cpu=None,
-        fast_build=False,
-    ):  # type: ignore[override]
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        fast_build: bool = False,
+    ) -> "GDNRecoverSSMMetadata":
         m = common_attn_metadata
         rows = None
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
@@ -139,6 +142,7 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
         commit = None
         if meta.num_spec_decodes > 0:
             n = meta.num_spec_decodes
+            assert meta.spec_state_indices_tensor is not None
             base["spec_state_indices_tensor"] = meta.spec_state_indices_tensor[:, :1]
             base["num_accepted_tokens"] = self._ones[:n]
             if rows is None:
@@ -157,7 +161,7 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             if not self._logged:
                 self._logged = True
-                logger.warning(
+                logger.info(
                     "GDN RecoverSSM path taken: %d spec rows, align=%s", n, align
                 )
         return GDNRecoverSSMMetadata(

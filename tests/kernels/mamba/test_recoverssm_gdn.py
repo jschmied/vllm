@@ -4,6 +4,8 @@
 per-token states, and the boundary checks (malformed metadata must raise ValueError
 before any kernel reads or writes out of bounds)."""
 
+from typing import Any, cast
+
 import pytest
 import torch
 
@@ -219,13 +221,15 @@ GATES = {
 def _make(qlens, nb=16, seed=0, gate="typical"):
     g = torch.Generator(device="cuda").manual_seed(seed)
     rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
-    alog, ascale, boff = GATES[gate]
+    a_log_shift, ascale, boff = GATES[gate]
     tot = sum(qlens)
     qsl = torch.tensor(
         [0, *torch.tensor(qlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
     )
     return dict(
-        A_log=(torch.rand(HV, device="cuda", generator=g) * 2 - 1 + alog).float(),
+        A_log=(
+            torch.rand(HV, device="cuda", generator=g) * 2 - 1 + a_log_shift
+        ).float(),
         a=(rnd(tot, HV) * ascale).bfloat16(),
         b=(rnd(tot, HV) + boff).bfloat16(),
         dt_bias=(rnd(HV) * 0.5).bfloat16(),
@@ -488,20 +492,20 @@ def test_layer_verify_qkv_views_and_fallback():
     layer = SimpleNamespace(
         key_dim=H * K, value_dim=HV * V, tp_size=1, head_k_dim=K, head_v_dim=V
     )
-    layer.rearrange_mixed_qkv = lambda x: Layer.rearrange_mixed_qkv(layer, x)
+    layer.rearrange_mixed_qkv = lambda x: Layer.rearrange_mixed_qkv(cast(Any, layer), x)
     width = 2 * H * K + HV * V
     packed = torch.randn(T, width + HV * V, dtype=torch.bfloat16)  # q|k|v|z, like qkvz
     strided = packed[:, :width]
-    q, k, v, is_view = Layer._recoverssm_verify_qkv(layer, strided)
+    q, k, v, is_view = Layer._recoverssm_verify_qkv(cast(Any, layer), strided)
     assert is_view
     assert q.data_ptr() == packed.data_ptr()
-    rq, rk, rv = Layer.rearrange_mixed_qkv(layer, strided)
+    rq, rk, rv = Layer.rearrange_mixed_qkv(cast(Any, layer), strided)
     assert torch.equal(q, rq) and torch.equal(k, rk) and torch.equal(v, rv)
 
     # Column-major storage: last dimension not contiguous -> copies, same values.
     col_major = strided.t().contiguous().t()
     assert col_major.stride(-1) != 1
-    q2, k2, v2, is_view2 = Layer._recoverssm_verify_qkv(layer, col_major)
+    q2, k2, v2, is_view2 = Layer._recoverssm_verify_qkv(cast(Any, layer), col_major)
     assert not is_view2
     assert torch.equal(q2, rq) and torch.equal(k2, rk) and torch.equal(v2, rv)
 

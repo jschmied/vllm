@@ -371,7 +371,7 @@ class ChunkGatedDeltaRule(CustomOp):
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _uses_gdn_recoverssm(self) -> bool:
-        """FNRSSM: one predicate for the replay state's shape, dtype and the attention
+        """One predicate for the replay state's shape, dtype and the attention
         backend."""
         from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
 
@@ -388,7 +388,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.num_spec,
         )
         if self._uses_gdn_recoverssm():
-            # FNRSSM: per-token replay record [HV, spec_query_len, V + K + 1] fp32
+            # per-token replay record [HV, spec_query_len, V + K + 1] fp32
             shapes = (
                 *shapes,
                 (
@@ -402,7 +402,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         dtypes = super().get_state_dtype()
         if self._uses_gdn_recoverssm():
-            dtypes = (*dtypes, torch.float32)  # FNRSSM
+            dtypes = (*dtypes, torch.float32)
         return dtypes
 
     def get_attn_backend(self):
@@ -411,7 +411,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 GDNRecoverSSMAttentionBackend,
             )
 
-            return GDNRecoverSSMAttentionBackend  # FNRSSM
+            return GDNRecoverSSMAttentionBackend
         return super().get_attn_backend()
 
     def __init__(
@@ -561,15 +561,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.gdn_decode_kernel = "XPU"
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
-        # FNRSSM: RecoverSSM verify replaces the per-draft snapshot path (Triton decode
+        # RecoverSSM verify replaces the per-draft snapshot path (Triton decode
         # only)
         self.use_gdn_recoverssm = self._uses_gdn_recoverssm()
         if self.use_gdn_recoverssm:
             self.gdn_decode_kernel = "triton"
             self.enable_fused_gdn_decode = False
             self.enable_packed_recurrent_decode = False
-            logger.warning_once(
-                "FNRSSM: GDN RecoverSSM speculative verify active (spec_query_len %d)",
+            logger.info_once(
+                "GDN RecoverSSM speculative verify active (spec_query_len %d)",
                 self.num_spec + 1,
             )
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
@@ -582,7 +582,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]  # FNRSSM
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -1146,9 +1146,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        state_dtype = self.get_state_dtype()[
-            1
-        ]  # FNRSSM: 3 dtypes with the replay record
+        state_dtype = self.get_state_dtype()[1]  # 3 dtypes with the replay record
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1408,7 +1406,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc,
                 max_query_len=(
                     self.num_spec + 1
-                    if getattr(self, "use_gdn_recoverssm", False)  # FNRSSM
+                    if getattr(self, "use_gdn_recoverssm", False)
                     else spec_state_indices_tensor.size(-1)
                 ),
                 validate_data=False,
@@ -1523,13 +1521,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None and getattr(
             self, "use_gdn_recoverssm", False
         ):
-            # FNRSSM: verify the window off the checkpoint; the commit after sampling
+            # verify the window off the checkpoint; the commit after sampling
             # writes the state once
             from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
                 gdn_recoverssm_verify,
             )
 
             _n = attn_metadata.num_spec_decodes
+            assert spec_query_start_loc is not None
+            assert spec_state_indices_tensor is not None
             core_attn_out_spec = gdn_recoverssm_verify(
                 self.A_log,
                 a_spec,

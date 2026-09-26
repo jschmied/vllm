@@ -182,7 +182,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 PleRecoverSSMAttentionBackend,
             )
 
-            return PleRecoverSSMAttentionBackend  # FNRSSM2
+            return PleRecoverSSMAttentionBackend
         return PleShortConvAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:

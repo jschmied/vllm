@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""RecoverSSM protocol for the Qwen4Exp PLE short-conv layer (FNRSSM phase 2, jschmied
-2026-09-25, local).
+"""RecoverSSM protocol for the Qwen4Exp PLE short-conv layer.
 
 When the GDN layers run RecoverSSM, the runner resets the shared num_accepted_tokens to
 1 after each commit (align mode). The PLE dilated short conv keeps an extended window in
@@ -22,6 +21,7 @@ from vllm.model_executor.layers.mamba.ops.recoverssm import (
 )
 from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_require
 from vllm.triton_utils import triton
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
@@ -46,9 +46,7 @@ class _PleConvCommit:
     def __init__(self, conv_states, spec_query_len: int, max_num_reqs: int):
         from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
-        _require(
-            len(conv_states) > 0, "PLE commit requires at least one layer"
-        )  # FNRSSMGUARD
+        _require(len(conv_states) > 0, "PLE commit requires at least one layer")
         if not is_conv_state_dim_first():
             conv_states = [
                 s.transpose(-1, -2) for s in conv_states
@@ -95,9 +93,7 @@ class _PleConvCommit:
         batch = state_indices.shape[0]
         if batch == 0:
             return
-        _require(
-            state_indices.ndim == 1, "state indices must be one-dimensional"
-        )  # FNRSSMGUARD
+        _require(state_indices.ndim == 1, "state indices must be one-dimensional")
         _require(
             batch <= self.commit_lens.shape[0],
             "PLE commit batch exceeds its plan capacity",
@@ -223,6 +219,7 @@ class PleRecoverSSMMetadata(PleShortConvAttentionMetadata, RecoverSSMMetadata):
         )
         if c.block_table is None:
             return None
+        assert c.block_size is not None and c.num_computed_tokens is not None
         return RecoverSSMPostprocessMetadata(
             num_spec_decodes=n,
             request_indices=c.request_indices,
@@ -233,25 +230,30 @@ class PleRecoverSSMMetadata(PleShortConvAttentionMetadata, RecoverSSMMetadata):
 
 
 class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
+    # Same as the GDN RecoverSSM builder: PIECEWISE only for now.
+    _cudagraph_support = AttentionCGSupport.NEVER
+
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.use_full_cuda_graph = False
         self._ones = torch.ones(
             vllm_config.scheduler_config.max_num_seqs, dtype=torch.int32, device=device
         )
-        self._ctx = None
+        self._ctx: _PleConvCommit | None = None
         self._logged = False
 
     def _get_ctx(self):
         if self._ctx is None:
             fc = self.vllm_config.compilation_config.static_forward_context
             convs = [fc[name].kv_cache[0] for name in self.layer_names]
-            self._ctx = _PleConvCommit(
+            ctx = _PleConvCommit(
                 convs, 1 + self.num_spec, self.vllm_config.scheduler_config.max_num_seqs
             )
-            logger.warning(
-                "FNRSSM PLE commit context: %d layers, history %d",
+            self._ctx = ctx
+            logger.info(
+                "PLE RecoverSSM commit context: %d layers, history %d",
                 len(convs),
-                self._ctx.hist,
+                ctx.hist,
             )
         return self._ctx
 
@@ -308,9 +310,7 @@ class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
         )
         if not self._logged:
             self._logged = True
-            logger.warning(
-                "FNRSSM PLE RecoverSSM path taken: %d spec rows, align=%s", n, align
-            )
+            logger.info("PLE RecoverSSM path taken: %d spec rows, align=%s", n, align)
         return PleRecoverSSMMetadata(
             **base, recoverssm_commit=commit, recoverssm_context=self._get_ctx()
         )

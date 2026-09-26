@@ -29,9 +29,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
-def _require(
-    cond: bool, msg: str
-) -> None:  # FNRSSMGUARD: boundary checks as in the KDA RecoverSSM ops
+def _require(cond: bool, msg: str) -> None:
     recoverssm_require(cond, msg, "GDN RecoverSSM")
 
 
@@ -195,7 +193,7 @@ def gdn_recoverssm_verify(
     K + 1] fp32. Returns out [1, T, HV, V]."""
     _require(
         q.ndim == 4 and q.shape[0] == 1, "q must have shape [1, tokens, heads, dim]"
-    )  # FNRSSMGUARD
+    )
     _, total, H, K = q.shape
     _require(k.shape == q.shape, "q and k shapes differ")
     _require(
@@ -273,7 +271,7 @@ def gdn_recoverssm_verify(
     _require(
         tuple(out.shape) == (1, total, HV, V) and out.stride()[2:] == (V, 1),
         "output shape or layout is incompatible",
-    )  # FNRSSMGUARD
+    )
     batch = state_indices.shape[0]
     if total == 0 or batch == 0:
         return out
@@ -455,9 +453,7 @@ class GDNRecoverSSMCommitContext:
         max_num_reqs: int,
         conv_dim_first: bool = True,
     ) -> "GDNRecoverSSMCommitContext":
-        _require(
-            len(checkpoints) > 0, "commit requires at least one layer"
-        )  # FNRSSMGUARD
+        _require(len(checkpoints) > 0, "commit requires at least one layer")
         _require(
             len(conv_states) == len(checkpoints) == len(replays),
             "conv, state and replay lists differ",
@@ -566,9 +562,7 @@ class GDNRecoverSSMCommitContext:
         batch = state_indices.shape[0]
         if batch == 0:
             return
-        _require(
-            state_indices.ndim == 1, "state indices must be one-dimensional"
-        )  # FNRSSMGUARD
+        _require(state_indices.ndim == 1, "state indices must be one-dimensional")
         _require(
             batch <= self.commit_lens.shape[0], "commit batch exceeds its plan capacity"
         )

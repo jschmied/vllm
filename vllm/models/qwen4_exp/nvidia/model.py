@@ -32,11 +32,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
+    MambaStateShapes,
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsReplaySSM,
     _require_is_multimodal,
 )
 from vllm.model_executor.models.qwen3_5 import (
@@ -641,6 +643,7 @@ class Qwen4ExpForCausalLM(
     SupportsPP,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
+    SupportsReplaySSM,
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -748,7 +751,7 @@ class Qwen4ExpForCausalLM(
 
     @classmethod
     def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
-        """FNRSSM: one predicate for the replay record's shape AND dtype (they must
+        """One predicate for the replay record's shape AND dtype (they must
         agree for the MambaSpec)."""
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
@@ -763,19 +766,21 @@ class Qwen4ExpForCausalLM(
     def get_gdn_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, ...]:
-        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype,
-            vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        dtypes: tuple[torch.dtype, ...] = (
+            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+                vllm_config.cache_config.mamba_ssm_cache_dtype,
+            )
         )
-        if cls._uses_gdn_recoverssm(vllm_config):  # FNRSSM: replay record, fp32
+        if cls._uses_gdn_recoverssm(vllm_config):  # replay record, fp32
             dtypes = (*dtypes, torch.float32)
         return dtypes
 
     @classmethod
     def get_gdn_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, ...], ...]:
+    ) -> MambaStateShapes:
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
@@ -795,7 +800,7 @@ class Qwen4ExpForCausalLM(
         )
         if cls._uses_gdn_recoverssm(
             vllm_config
-        ):  # FNRSSM: replay record [HV, spec_query_len, V + K + 1]
+        ):  # replay record [HV, spec_query_len, V + K + 1]
             shapes = (
                 *shapes,
                 (
@@ -816,7 +821,7 @@ class Qwen4ExpForCausalLM(
     @classmethod
     def get_mamba_state_shape_from_config(
         cls, vllm_config: VllmConfig
-    ) -> tuple[tuple[int, ...], ...]:
+    ) -> MambaStateShapes:
         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
@@ -904,6 +909,7 @@ class Qwen4ExpForConditionalGeneration(
     Qwen3_5ForConditionalGeneration,
     HasInnerState,
     Qwen4ExpMixtureOfExperts,
+    SupportsReplaySSM,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
 
@@ -1088,14 +1094,15 @@ class Qwen4ExpForConditionalGeneration(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[torch.dtype, torch.dtype]:
+    ) -> tuple[torch.dtype, ...]:
         return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
-    def get_mamba_state_shape_from_config(
+    def get_mamba_state_shape_from_config(  # type: ignore[override]
         cls,
         vllm_config: VllmConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
+    ) -> MambaStateShapes:
+        # GDN RecoverSSM adds a third state (the replay record) to Qwen3.5's two.
         return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod

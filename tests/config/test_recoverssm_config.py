@@ -1,44 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Configuration-level regression tests for Qwen GDN/PLE RecoverSSM selection.
+"""Configuration-level regression tests for Qwen4Exp GDN/PLE RecoverSSM selection.
 
-Two bugs in this path passed every kernel test and only showed on a server start:
-the runtime-check helper was inserted between ``@model_validator`` and
-``validate_mamba_cached_kernel`` (the decorator moved, the validator never ran),
-and the MTP drafter's derived config switched the shared choice off again.
-These tests run the real validator function against stand-in configs.
+``--use-replayssm`` with speculative decoding selects RecoverSSM for Qwen4Exp, as it
+does for Kimi-K3 KDA. The MTP drafter's derived config shares ``cache_config`` and must
+keep the choice. These tests run the real validator function against stand-in configs.
 """
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from vllm.config.mamba import MambaBackendEnum
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
+from vllm.v1.attention.backend import AttentionCGSupport
 
 TARGET = "Qwen4ExpForConditionalGeneration"
 DRAFTER = "Qwen4ExpMTP"
 
 
 def _validator():
-    validators = VllmConfig.__pydantic_decorators__.model_validators
+    validators = VllmConfig.__pydantic_decorators__.model_validators  # type: ignore[attr-defined]
     return validators["validate_mamba_cached_kernel"].func
 
 
-def _config(arch: str, cache_config=None, num_spec: int = 3, **overrides):
+def _config(
+    arch: str,
+    cache_config=None,
+    num_spec: int = 3,
+    use_replayssm: bool = True,
+    supports_replayssm: bool = True,
+    **overrides,
+):
     cfg = SimpleNamespace(
         num_speculative_tokens=num_spec,
-        model_config=SimpleNamespace(architecture=arch, supports_replayssm=False),
+        model_config=SimpleNamespace(
+            architecture=arch, supports_replayssm=supports_replayssm
+        ),
         cache_config=cache_config
         or SimpleNamespace(
-            use_recoverssm=False, use_replayssm=False, mamba_cache_mode="align"
+            use_recoverssm=False,
+            use_replayssm=use_replayssm,
+            mamba_cache_mode="align",
         ),
         mamba_config=SimpleNamespace(
             enable_stochastic_rounding=False, backend=MambaBackendEnum.TRITON
         ),
         use_v2_model_runner=True,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        kv_transfer_config=None,
     )
     for key, value in overrides.items():
         target, _, attr = key.partition("__")
@@ -46,41 +58,38 @@ def _config(arch: str, cache_config=None, num_spec: int = 3, **overrides):
             setattr(getattr(cfg, target), attr, value)
         else:
             setattr(cfg, target, value)
-    cfg._validate_recoverssm_runtime = lambda: VllmConfig._validate_recoverssm_runtime(
-        cfg
-    )
     return cfg
 
 
 def test_validator_is_registered():
-    validators = VllmConfig.__pydantic_decorators__.model_validators
-    assert "validate_mamba_cached_kernel" in validators
-    assert "_validate_recoverssm_runtime" not in validators
+    assert "validate_mamba_cached_kernel" in (
+        VllmConfig.__pydantic_decorators__.model_validators  # type: ignore[attr-defined]
+    )
 
 
-def test_target_then_derived_drafter_keep_the_choice(monkeypatch):
-    monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
+@pytest.mark.parametrize(
+    "arch", ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"]
+)
+def test_replayssm_with_spec_selects_recoverssm(arch):
+    cfg = _config(arch)
+    _validator()(cfg)
+    assert cfg.cache_config.use_recoverssm is True
+    assert uses_recoverssm(cfg.cache_config, 3)
+
+
+def test_derived_drafter_keeps_the_choice_and_runs_the_checks():
     target = _config(TARGET)
     _validator()(target)
-    assert target.cache_config.use_recoverssm is True
-
-    # The drafter's derived config shares cache_config and must keep the choice.
     drafter = _config(DRAFTER, cache_config=target.cache_config)
     _validator()(drafter)
     assert target.cache_config.use_recoverssm is True
-
-
-def test_derived_drafter_runs_the_runtime_checks(monkeypatch):
-    monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
-    target = _config(TARGET)
-    _validator()(target)
-    drafter = _config(
+    bad = _config(
         DRAFTER,
         cache_config=target.cache_config,
         parallel_config__pipeline_parallel_size=2,
     )
     with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        _validator()(drafter)
+        _validator()(bad)
 
 
 @pytest.mark.parametrize(
@@ -93,33 +102,28 @@ def test_derived_drafter_runs_the_runtime_checks(monkeypatch):
         ("cache_config__mamba_cache_mode", "all", "none and align"),
     ],
 )
-def test_runtime_checks_reject(monkeypatch, override, value, match):
-    monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
+def test_runtime_checks_reject(override, value, match):
     cfg = _config(TARGET, **{override: value})
     with pytest.raises(ValueError, match=match):
         _validator()(cfg)
 
 
-def test_flag_unset_keeps_the_stock_path(monkeypatch):
-    monkeypatch.delenv("FN_GDN_RECOVERSSM", raising=False)
-    cfg = _config(TARGET)
+def test_flag_unset_keeps_the_stock_path():
+    cfg = _config(TARGET, use_replayssm=False)
     _validator()(cfg)
     assert cfg.cache_config.use_recoverssm is False
     assert not uses_recoverssm(cfg.cache_config, 3)
 
 
-def test_no_speculative_tokens_is_not_selected(monkeypatch):
-    monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
-    cfg = _config(TARGET, num_spec=0)
-    _validator()(cfg)
-    assert cfg.cache_config.use_recoverssm is False
+def test_qwen4exp_replayssm_requires_speculative_decoding():
+    with pytest.raises(ValueError, match="requires speculative decoding"):
+        _validator()(_config(TARGET, num_spec=0))
 
 
-def test_other_architectures_are_not_selected(monkeypatch):
-    monkeypatch.setenv("FN_GDN_RECOVERSSM", "1")
-    cfg = _config("Qwen3NextForCausalLM")
-    _validator()(cfg)
-    assert cfg.cache_config.use_recoverssm is False
+def test_architecture_without_replayssm_support_is_rejected():
+    cfg = _config("Qwen3NextForCausalLM", supports_replayssm=False)
+    with pytest.raises(ValueError, match="not supported for architecture"):
+        _validator()(cfg)
 
 
 def test_uses_recoverssm_predicate():
@@ -130,13 +134,12 @@ def test_uses_recoverssm_predicate():
     assert not uses_recoverssm(SimpleNamespace(), 3)
 
 
-def test_builder_refuses_full_cuda_graphs(monkeypatch):
-    from vllm.v1.attention.backends import gdn_attn
+def test_builders_fall_back_to_piecewise():
     from vllm.v1.attention.backends.gdn_recoverssm import GDNRecoverSSMMetadataBuilder
+    from vllm.v1.attention.backends.ple_recoverssm import PleRecoverSSMMetadataBuilder
 
-    def fake_init(self, *args, **kwargs):
-        self.use_full_cuda_graph = True
-
-    monkeypatch.setattr(gdn_attn.GDNAttentionMetadataBuilder, "__init__", fake_init)
-    with pytest.raises(ValueError, match="PIECEWISE"):
-        GDNRecoverSSMMetadataBuilder(None, [], None, "cpu")
+    for builder in (GDNRecoverSSMMetadataBuilder, PleRecoverSSMMetadataBuilder):
+        assert (
+            builder.get_cudagraph_support(cast(Any, None), cast(Any, None))
+            == AttentionCGSupport.NEVER
+        )
