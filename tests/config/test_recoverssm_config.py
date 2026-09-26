@@ -145,12 +145,14 @@ def test_builders_fall_back_to_piecewise():
         )
 
 
+@pytest.mark.parametrize("compile_mode", ["VLLM_COMPILE", "NONE"])
 @pytest.mark.parametrize(("breakable", "expected"), [("1", "PIECEWISE"), ("0", "NONE")])
 def test_never_support_falls_back_to_piecewise_with_breakable_cudagraphs(
-    monkeypatch, breakable, expected
+    monkeypatch, compile_mode, breakable, expected
 ):
     """A backend without full-graph support must keep piecewise graphs when breakable
-    CUDA graphs split at attention (splitting_ops is empty then)."""
+    CUDA graphs split at attention (splitting_ops is empty then, and torch.compile may
+    be off)."""
     from vllm.config.compilation import (
         CompilationConfig,
         CompilationMode,
@@ -159,7 +161,7 @@ def test_never_support_falls_back_to_piecewise_with_breakable_cudagraphs(
 
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", breakable)
     compilation_config = CompilationConfig(
-        mode=CompilationMode.VLLM_COMPILE,
+        mode=CompilationMode[compile_mode],
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         splitting_ops=[],
     )

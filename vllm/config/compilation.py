@@ -1424,12 +1424,15 @@ class CompilationConfig:
                 f"with {min_cg_attn_backend} backend (support: "
                 f"{min_cg_support})"
             )
-            if self.mode == CompilationMode.VLLM_COMPILE and (
-                self.splitting_ops_contain_attention()
-                or self.use_inductor_graph_partition
-                # breakable CUDA graphs break at the attention kernels at runtime
-                or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
-            ):
+            if (
+                self.mode == CompilationMode.VLLM_COMPILE
+                and (
+                    self.splitting_ops_contain_attention()
+                    or self.use_inductor_graph_partition
+                )
+            ) or envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+                # Breakable CUDA graphs break at the attention kernels at runtime,
+                # with or without torch.compile.
                 msg += (
                     "; setting cudagraph_mode=PIECEWISE because "
                     "attention is compiled piecewise"
