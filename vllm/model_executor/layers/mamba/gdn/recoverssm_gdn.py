@@ -352,6 +352,7 @@ def _commit_gdn_state_kernel(
     BV: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BOUNDARY: tl.constexpr,
+    V_TILES: tl.constexpr,
 ):
     # Every program runs one fold and keeps one tile live. In align mode the
     # block-boundary state (the window's first boundary_len tokens) is folded by a
@@ -389,31 +390,32 @@ def _commit_gdn_state_kernel(
     rbs = tl.load(replay_block_strides_ptr + pid_l)
     rec_base = replay_ptr + src * rbs + pid_h * stride_replay_head
     offs_k = tl.arange(0, BK)
-    offs_v = pid_v * BV + tl.arange(0, BV)
     mask_k = offs_k < K
-    mask_v = offs_v < V
-    mask_state = mask_v[:, None] & mask_k[None, :]
-    sp = offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
-    s0 = tl.load(
-        state_ptr + src * sbs + pid_h * stride_state_head + sp,
-        mask=mask_state,
-        other=0.0,
-    ).to(tl.float32)
-    decay = 1.0
-    corr = tl.zeros([BV, BK], tl.float32)
-    for r in range(n):
-        t = n - r - 1
-        rec = rec_base + t * stride_replay_pos
-        c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
-        kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
-        g = tl.load(rec + (V + K) * stride_replay_dim)
-        corr += (c[:, None] * kk[None, :]) * decay
-        decay *= tl.exp(g)
-    tl.store(
-        state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
-        (s0 * decay + corr).to(state_ref_ptr.dtype.element_ty),
-        mask=mask_state,
-    )
+    for vt in range(V_TILES):
+        offs_v = (pid_v * V_TILES + vt) * BV + tl.arange(0, BV)
+        mask_v = offs_v < V
+        mask_state = mask_v[:, None] & mask_k[None, :]
+        sp = offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
+        s0 = tl.load(
+            state_ptr + src * sbs + pid_h * stride_state_head + sp,
+            mask=mask_state,
+            other=0.0,
+        ).to(tl.float32)
+        decay = 1.0
+        corr = tl.zeros([BV, BK], tl.float32)
+        for r in range(n):
+            t = n - r - 1
+            rec = rec_base + t * stride_replay_pos
+            c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
+            kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
+            g = tl.load(rec + (V + K) * stride_replay_dim)
+            corr += (c[:, None] * kk[None, :]) * decay
+            decay *= tl.exp(g)
+        tl.store(
+            state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
+            (s0 * decay + corr).to(state_ref_ptr.dtype.element_ty),
+            mask=mask_state,
+        )
 
 
 @dataclass
@@ -679,11 +681,14 @@ class GDNRecoverSSMCommitContext:
             rr.stride(3),
             state_indices.stride(0),
         )
-        grid = (triton.cdiv(V, BV), batch, num_layers * HV)
+        num_v_tiles = triton.cdiv(V, BV)
         # Final states first: a boundary state can land in the window's source
         # slot, which the final-state fold reads (stream order separates them).
         for boundary in (False, True) if align else (False,):
-            _commit_gdn_state_kernel[grid](
+            # Almost every row exits the boundary launch: one program per row
+            # loops over the V tiles instead.
+            tiles = num_v_tiles if boundary else 1
+            _commit_gdn_state_kernel[(num_v_tiles // tiles, batch, num_layers * HV)](
                 *args,
                 K=K,
                 V=V,
@@ -691,6 +696,7 @@ class GDNRecoverSSMCommitContext:
                 BV=BV,
                 NUM_HEADS=HV,
                 BOUNDARY=boundary,
+                V_TILES=tiles,
                 num_warps=4,
                 num_stages=2,
             )
