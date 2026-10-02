@@ -383,6 +383,12 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _ple_prefetch_ahead(layer: nn.Module) -> bool:
+    """Whether a layer's PLE lookup starts one layer early (see prefetch_ahead)."""
+    ple: Qwen4ExpPLELayer | None = getattr(layer, "ple", None)
+    return ple is None or ple.prefetch_ahead
+
+
 class Qwen4ExpModel(nn.Module):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
@@ -514,7 +520,9 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
-        if self.start_layer < self.end_layer:
+        if self.start_layer < self.end_layer and _ple_prefetch_ahead(
+            self.layers[self.start_layer]
+        ):
             self._start_layer_ple_prefetch(
                 self.layers[self.start_layer],
                 hidden_states,
@@ -526,9 +534,19 @@ class Qwen4ExpModel(nn.Module):
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
             last_layer = layer
-            if layer_idx + 1 < self.end_layer:
+            if layer_idx + 1 < self.end_layer and _ple_prefetch_ahead(
+                self.layers[layer_idx + 1]
+            ):
                 self._start_layer_ple_prefetch(
                     self.layers[layer_idx + 1],
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
+            if not _ple_prefetch_ahead(layer):
+                self._start_layer_ple_prefetch(
+                    layer,
                     hidden_states,
                     input_ids,
                     query_start_loc,

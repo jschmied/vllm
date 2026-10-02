@@ -151,6 +151,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             output_dtype,
         )
 
+    @property
+    def prefetch_ahead(self) -> bool:
+        """Whether to start the lookup one decoder layer before this one."""
+        return self.ple_embedding.ngram_embedding.prefetch_ahead
+
     def start_prefetch(
         self,
         hidden_states: torch.Tensor,
