@@ -149,6 +149,25 @@ def test_cpu_views_address_the_checkpoint_rows(tmp_path):
     table.touch(rows, pool=None)  # CPU fault-in path must not raise
 
 
+def test_pageable_lookup_starts_at_its_own_layer():
+    from vllm.models.qwen4_exp.common.ngram_embedding import (
+        Qwen4ExpPLEPinnedHostEmbedding,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import _ple_prefetch_ahead
+
+    # Pinned looks up on a side stream: start a layer early to overlap it.
+    assert Qwen4ExpPLEPinnedHostEmbedding.prefetch_ahead
+    # Pageable looks up on the current stream: start it at its own layer.
+    assert not Qwen4ExpPLEPageableHostEmbedding.prefetch_ahead
+    assert _ple_prefetch_ahead(SimpleNamespace(ple=None))
+    assert _ple_prefetch_ahead(
+        SimpleNamespace(ple=SimpleNamespace(prefetch_ahead=True))
+    )
+    assert not _ple_prefetch_ahead(
+        SimpleNamespace(ple=SimpleNamespace(prefetch_ahead=False))
+    )
+
+
 def _indexed_checkpoint_with_stale_file(tmp_path) -> str:
     """One indexed file plus a stale extra file holding the same four shards."""
     model = _checkpoint(tmp_path, [{0: 3, 1: 3, 2: 3, 3: 3}])

@@ -3,6 +3,7 @@
 """Qwen4Exp n-gram embeddings with device, pinned-host and checkpoint-mapped storage."""
 
 from collections.abc import Iterable
+from typing import ClassVar
 
 import regex as re
 import torch
@@ -60,6 +61,12 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     inherited from the pinned-host backend; the lookup itself runs on the current
     stream (not the pinned backend's side stream) and gathers from the mapping.
     """
+
+    # On the current stream a lookup started a layer early only runs before
+    # that layer's kernels. Started at its own layer, the CPU page prefetch
+    # (which begins when the step's ids reach the host) gets the preceding
+    # layer's time to fault the rows in before the GPU reads them.
+    prefetch_ahead: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -230,8 +237,7 @@ class Qwen4ExpPLEPageableHostEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         With the side-stream lookup, greedy outputs on GB10 were not reproducible
         within one server start (identical prompts matched in 2 of 8, logprobs
         differed by up to 1.4); on the current stream they matched in 8 of 8 with
-        zero logprob difference. The CPU page prefetch already runs ahead of the
-        step, so the side stream buys no overlap worth keeping here.
+        zero logprob difference.
         """
         self._lookup_on_current_stream(ngram_ids)
 
