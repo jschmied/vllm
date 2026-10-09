@@ -57,6 +57,9 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
     """ETP-sharded PLE table shared by device and pinned-host backends."""
 
     supports_prefetch: ClassVar[bool] = False
+    # Start the lookup one decoder layer before its own (overlaps it with that
+    # layer when it runs on a side stream); False starts it at its own layer.
+    prefetch_ahead: ClassVar[bool] = True
 
     def __init__(
         self,

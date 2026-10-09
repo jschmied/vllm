@@ -262,6 +262,8 @@ class MappedTable:
             ].reshape(s.rows, self.row_bytes)
             for s in layout.shards
         ]
+        # Each view's mapping and offset in it, to madvise a shard's rows.
+        self._regions = [(self._maps[s.path][0], s.offset) for s in layout.shards]
         bases = [v.__array_interface__["data"][0] for v in self.views]
         self.shard_base = torch.tensor(bases, dtype=torch.int64, device=device)
         self._block = triton.next_power_of_2(self.row_bytes)
@@ -291,6 +293,7 @@ class MappedTable:
         array = np.frombuffer(mapping, dtype=np.uint8)
         self._maps = {"<zeros>": (mapping, array)}
         self.views = [array[: num_rows * row_bytes].reshape(num_rows, row_bytes)]
+        self._regions = [(mapping, 0)]
         self.layout = None
         self.shard_base = torch.tensor(
             [array.__array_interface__["data"][0]], dtype=torch.int64, device=device
@@ -320,7 +323,13 @@ class MappedTable:
         )
 
     def touch(self, rows: np.ndarray, pool: ThreadPoolExecutor | None) -> None:
-        """Fault in both ends of every row (a row may straddle a page)."""
+        """Fault in both ends of every row (a row may straddle a page).
+
+        The rows' pages are first passed to madvise(MADV_WILLNEED), which
+        queues all their reads at once, so the touches below mostly map pages
+        that are already in the page cache. Without it, each cold page of a
+        decode step (touched on one thread) is a separate synchronous read.
+        """
         rows = np.sort(rows)
         shard = rows // self.rows_per_shard
         local = rows - shard * self.rows_per_shard
@@ -343,6 +352,7 @@ class MappedTable:
             view, index = task
             return int(view[index, 0].sum()) + int(view[index, last].sum())
 
+        self._will_need(shard, local)
         if pool is None or rows.size <= 4096:
             for task in groups(np.arange(rows.size)):
                 fault(task)
@@ -352,6 +362,23 @@ class MappedTable:
             if chunk.size:
                 tasks.extend(groups(chunk))
         list(pool.map(fault, tasks))
+
+    def _will_need(self, shard: np.ndarray, local: np.ndarray) -> None:
+        """madvise(MADV_WILLNEED) the pages of these rows, one call per run."""
+        page = mmap.PAGESIZE  # madvise needs kernel page alignment
+        for index in np.unique(shard):
+            mapping, offset = self._regions[index]
+            # Byte offset of each row in the shard's file mapping.
+            start = offset + local[shard == index] * self.row_bytes
+            # Pages of each row's first and last byte (rows fit in a page).
+            pages = np.unique(
+                np.concatenate((start // page, (start + self.row_bytes - 1) // page))
+            )
+            # Split into runs of consecutive pages, one madvise per run.
+            for run in np.split(pages, np.flatnonzero(np.diff(pages) != 1) + 1):
+                mapping.madvise(
+                    mmap.MADV_WILLNEED, int(run[0]) * page, int(run.size) * page
+                )
 
 
 class PagePrefetcher:
